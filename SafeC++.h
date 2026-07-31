@@ -6,36 +6,36 @@
 #include <shared_mutex>
 #include <utility>
 
-namespace Safe {
+namespace safe {
 
 template<typename T, typename M>
 class [[nodiscard]] SharedLockGuard
 {
     const T *m_data;
     M *m_mutex;
-    bool m_owns_lock;
+    bool m_ownsLock;
 
 public:
     SharedLockGuard(const T *data, M *mutex)
         : m_data(data)
         , m_mutex(mutex)
-        , m_owns_lock(true)
+        , m_ownsLock(true)
     {
         m_mutex->lock_shared();
     }
 
     ~SharedLockGuard()
     {
-        if (m_owns_lock)
+        if (m_ownsLock)
             m_mutex->unlock_shared();
     }
 
     SharedLockGuard(SharedLockGuard &&other) noexcept
         : m_data(other.m_data)
         , m_mutex(other.m_mutex)
-        , m_owns_lock(other.m_owns_lock)
+        , m_ownsLock(other.m_ownsLock)
     {
-        other.m_owns_lock = false;
+        other.m_ownsLock = false;
     }
 
     SharedLockGuard(const SharedLockGuard &) = delete;
@@ -50,29 +50,29 @@ class [[nodiscard]] UniqueLockGuard
 {
     T *m_data;
     M *m_mutex;
-    bool m_owns_lock;
+    bool m_ownsLock;
 
 public:
     UniqueLockGuard(T *data, M *mutex)
         : m_data(data)
         , m_mutex(mutex)
-        , m_owns_lock(true)
+        , m_ownsLock(true)
     {
         m_mutex->lock();
     }
 
     ~UniqueLockGuard()
     {
-        if (m_owns_lock)
+        if (m_ownsLock)
             m_mutex->unlock();
     }
 
     UniqueLockGuard(UniqueLockGuard &&other) noexcept
         : m_data(other.m_data)
         , m_mutex(other.m_mutex)
-        , m_owns_lock(other.m_owns_lock)
+        , m_ownsLock(other.m_ownsLock)
     {
-        other.m_owns_lock = false;
+        other.m_ownsLock = false;
     }
 
     UniqueLockGuard(const UniqueLockGuard &) = delete;
@@ -88,39 +88,39 @@ public:
 namespace __Internal__ {
 struct ControlBlockBase
 {
-    std::atomic<size_t> shared_refs{1};
-    std::atomic<size_t> weak_refs{1}; // 1 implicit count held collectively by shared_refs
+    std::atomic<size_t> sharedRefs{1};
+    std::atomic<size_t> weakRefs{1}; // 1 implicit count held collectively by shared_refs
 
     virtual ~ControlBlockBase() = default;
-    virtual void destroy_data() noexcept = 0;
-    virtual void destroy_self() noexcept = 0;
+    virtual void destroyData() noexcept = 0;
+    virtual void destroySelf() noexcept = 0;
 
-    void add_shared() noexcept { shared_refs.fetch_add(1, std::memory_order_relaxed); }
+    void addShared() noexcept { sharedRefs.fetch_add(1, std::memory_order_relaxed); }
 
-    void release_shared() noexcept
+    void releaseShared() noexcept
     {
         // If we are the last shared owner
-        if (shared_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            destroy_data(); // Destroy T immediately
-            release_weak(); // Decrement the implicit weak ref
+        if (sharedRefs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            destroyData(); // Destroy T immediately
+            releaseWeak(); // Decrement the implicit weak ref
         }
     }
 
-    void add_weak() noexcept { weak_refs.fetch_add(1, std::memory_order_relaxed); }
+    void addWeak() noexcept { weakRefs.fetch_add(1, std::memory_order_relaxed); }
 
-    void release_weak() noexcept
+    void releaseWeak() noexcept
     {
         // If we are the absolute last observer (no shared, no weak)
-        if (weak_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            destroy_self(); // Free the Control Block memory itself
+        if (weakRefs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            destroySelf(); // Free the Control Block memory itself
         }
     }
 
-    bool try_add_shared() noexcept
+    bool tryAddShared() noexcept
     {
-        size_t count = shared_refs.load(std::memory_order_relaxed);
+        size_t count = sharedRefs.load(std::memory_order_relaxed);
         while (count != 0) {
-            if (shared_refs.compare_exchange_weak(count,
+            if (sharedRefs.compare_exchange_weak(count,
                                                   count + 1,
                                                   std::memory_order_acquire,
                                                   std::memory_order_relaxed)) {
@@ -142,9 +142,9 @@ struct ControlBlock : public ControlBlockBase
         : data(std::in_place, std::forward<Args>(args)...)
     {}
 
-    void destroy_data() noexcept override { data.reset(); }
+    void destroyData() noexcept override { data.reset(); }
 
-    void destroy_self() noexcept override { delete this; }
+    void destroySelf() noexcept override { delete this; }
 };
 } // namespace __Internal__
 
@@ -159,7 +159,7 @@ protected:
     void release() noexcept
     {
         if (m_cb) {
-            m_cb->release_shared();
+            m_cb->releaseShared();
             m_cb = nullptr;
             m_data = nullptr;
             m_mutex = nullptr;
@@ -181,7 +181,7 @@ public:
         , m_mutex(other.m_mutex)
     {
         if (m_cb)
-            m_cb->add_shared();
+            m_cb->addShared();
     }
 
     SharedPtr(SharedPtr &&other) noexcept
@@ -200,7 +200,7 @@ public:
             m_data = other.m_data;
             m_mutex = other.m_mutex;
             if (m_cb)
-                m_cb->add_shared();
+                m_cb->addShared();
         }
         return *this;
     }
@@ -216,7 +216,7 @@ public:
         return *this;
     }
 
-    __Internal__::ControlBlockBase *get_control_block() const noexcept { return m_cb; }
+    __Internal__::ControlBlockBase *controlBlock() const noexcept { return m_cb; }
 
     // Explicit Bool Operator to check if valid
     explicit operator bool() const noexcept { return m_cb != nullptr; }
@@ -242,7 +242,7 @@ private:
     void release() noexcept
     {
         if (m_cb) {
-            m_cb->release_weak();
+            m_cb->releaseWeak();
             m_cb = nullptr;
         }
     }
@@ -251,17 +251,17 @@ public:
     WeakPtr() = default;
 
     WeakPtr(const SharedPtr<T, M> &shared) noexcept
-        : m_cb(shared.get_control_block())
+        : m_cb(shared.controlBlock())
     {
         if (m_cb)
-            m_cb->add_weak();
+            m_cb->addWeak();
     }
 
     WeakPtr(const WeakPtr &other) noexcept
         : m_cb(other.m_cb)
     {
         if (m_cb)
-            m_cb->add_weak();
+            m_cb->addWeak();
     }
 
     WeakPtr(WeakPtr &&other) noexcept
@@ -276,7 +276,7 @@ public:
             release();
             m_cb = other.m_cb;
             if (m_cb)
-                m_cb->add_weak();
+                m_cb->addWeak();
         }
         return *this;
     }
@@ -284,29 +284,29 @@ public:
     WeakPtr &operator=(const SharedPtr<T, M> &shared) noexcept
     {
         release();
-        m_cb = shared.get_control_block();
+        m_cb = shared.controlBlock();
         if (m_cb)
-            m_cb->add_weak();
+            m_cb->addWeak();
         return *this;
     }
 
     bool expired() const noexcept
     {
-        return !m_cb || m_cb->shared_refs.load(std::memory_order_relaxed) == 0;
+        return !m_cb || m_cb->sharedRefs.load(std::memory_order_relaxed) == 0;
     }
 
     SharedPtr<T, M> lock() const noexcept
     {
-        if (m_cb && m_cb->try_add_shared()) {
-            auto *concrete_cb = static_cast<__Internal__::ControlBlock<T, M> *>(m_cb);
-            return SharedPtr<T, M>(m_cb, &(*concrete_cb->data), &concrete_cb->mutex);
+        if (m_cb && m_cb->tryAddShared()) {
+            auto *concreteCb = static_cast<__Internal__::ControlBlock<T, M> *>(m_cb);
+            return SharedPtr<T, M>(m_cb, &(*concreteCb->data), &concreteCb->mutex);
         }
         return SharedPtr<T, M>{};
     }
 };
 
 template<typename T, typename M = std::shared_mutex, typename... Args>
-SharedPtr<T, M> MakeShared(Args &&...args)
+SharedPtr<T, M> makeShared(Args &&...args)
 {
     auto *cb = new __Internal__::ControlBlock<T, M>(std::forward<Args>(args)...);
     return SharedPtr<T, M>(cb, &(*cb->data), &cb->mutex);
@@ -321,18 +321,18 @@ private:
         if (!this->m_cb)
             return;
 
-        if (this->m_cb->shared_refs.load(std::memory_order_acquire) > 1) {
+        if (this->m_cb->sharedRefs.load(std::memory_order_acquire) > 1) {
             // Read-Lock old data to protect copy constructor execution
-            auto old_data_guard = this->sharedLock();
+            auto oldDataGuard = this->sharedLock();
 
             // Create cloned block
-            auto *new_cb = new __Internal__::ControlBlock<T, M>(*old_data_guard);
+            auto *newCb = new __Internal__::ControlBlock<T, M>(*oldDataGuard);
 
             this->release();
 
-            this->m_cb = new_cb;
-            this->m_data = &(*new_cb->data);
-            this->m_mutex = &new_cb->mutex;
+            this->m_cb = newCb;
+            this->m_data = &(*newCb->data);
+            this->m_mutex = &newCb->mutex;
         }
     }
 
@@ -358,7 +358,7 @@ public:
 };
 
 template<typename T, typename M = std::shared_mutex, typename... Args>
-CopyOnWritePtr<T, M> MakeCopyOnWrite(Args &&...args)
+CopyOnWritePtr<T, M> makeCopyOnWrite(Args &&...args)
 {
     auto *cb = new __Internal__::ControlBlock<T, M>(std::forward<Args>(args)...);
     return CopyOnWritePtr<T, M>(cb, &(*cb->data), &cb->mutex);
