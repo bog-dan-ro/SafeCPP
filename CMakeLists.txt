@@ -14,7 +14,7 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
     set(SAFECPP_IS_TOP_LEVEL ON)
 endif()
 
-option(SAFECPP_BUILD_DEMO "Build the demo executable" ${SAFECPP_IS_TOP_LEVEL})
+option(SAFECPP_BUILD_EXAMPLES "Build the examples" ${SAFECPP_IS_TOP_LEVEL})
 option(SAFECPP_BUILD_TESTS "Build the unit tests" ${SAFECPP_IS_TOP_LEVEL})
 option(SAFECPP_INSTALL "Generate the install and package rules" ${SAFECPP_IS_TOP_LEVEL})
 
@@ -23,9 +23,10 @@ option(SAFECPP_INSTALL "Generate the install and package rules" ${SAFECPP_IS_TOP
 add_library(SafeCpp INTERFACE)
 add_library(Safe::CPP ALIAS SafeCpp)
 
-# cxx_std_23 is a requirement, not a preference: it propagates to anything that
-# links Safe::CPP, so consumers cannot accidentally compile the header as C++20
-target_compile_features(SafeCpp INTERFACE cxx_std_23)
+# The header itself only needs C++20 (concepts, three way comparison, ranges).
+# Requiring more would push a needless constraint onto every consumer: only the
+# examples and the tests need C++23, and they ask for it themselves.
+target_compile_features(SafeCpp INTERFACE cxx_std_20)
 
 target_include_directories(SafeCpp INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
@@ -34,11 +35,17 @@ target_include_directories(SafeCpp INTERFACE
 # Exported as Safe::CPP, otherwise the namespace would give us Safe::SafeCpp
 set_target_properties(SafeCpp PROPERTIES EXPORT_NAME CPP)
 
-# ----------------------------------------------------------------- demo
+# An INTERFACE library has no sources of its own, so IDEs would not show the
+# header anywhere. This target exists purely to put it in the project tree, it
+# builds nothing and is not created for projects that consume us.
+if(SAFECPP_IS_TOP_LEVEL)
+    add_custom_target(SafeCppHeader SOURCES SafeCpp.h)
+endif()
 
-if(SAFECPP_BUILD_DEMO)
-    add_executable(SafeCppDemo main.cpp SafeCpp.h)
-    target_link_libraries(SafeCppDemo PRIVATE Safe::CPP)
+# ----------------------------------------------------------------- examples
+
+if(SAFECPP_BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()
 
 # ----------------------------------------------------------------- tests

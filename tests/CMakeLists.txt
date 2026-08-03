@@ -17,6 +17,9 @@ add_executable(SafeCppTests
 # The tests consume the library exactly the way an external project does
 target_link_libraries(SafeCppTests PRIVATE Safe::CPP Threads::Threads)
 
+# The harness uses <print> and std::formattable, the library does not
+target_compile_features(SafeCppTests PRIVATE cxx_std_23)
+
 # One CTest entry per suite, the binary takes the suite name as its filter
 foreach(suite SharedPtr WeakPtr Cast CopyOnWrite Api ScopedLock Threading)
     add_test(NAME ${suite} COMMAND SafeCppTests ${suite})
