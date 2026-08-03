@@ -1,7 +1,7 @@
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-add_executable(ts_smart_ptrs_tests
+add_executable(SafeCppTests
     TestHarness.h
     TestTypes.h
     main.cpp
@@ -11,15 +11,15 @@ add_executable(ts_smart_ptrs_tests
     tst_casts.cpp
     tst_copy_on_write.cpp
     tst_threading.cpp
-    ../SafeC++.h
+    ../SafeCpp.h
 )
 
-target_include_directories(ts_smart_ptrs_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
-target_link_libraries(ts_smart_ptrs_tests PRIVATE Threads::Threads)
+# The tests consume the library exactly the way an external project does
+target_link_libraries(SafeCppTests PRIVATE Safe::CPP Threads::Threads)
 
 # One CTest entry per suite, the binary takes the suite name as its filter
 foreach(suite SharedPtr WeakPtr Cast CopyOnWrite Api ScopedLock Threading)
-    add_test(NAME ${suite} COMMAND ts_smart_ptrs_tests ${suite})
+    add_test(NAME ${suite} COMMAND SafeCppTests ${suite})
     # Make a sanitizer report fail the test instead of only printing a warning
     # a deadlock must fail the run instead of hanging it
     set_tests_properties(${suite} PROPERTIES TIMEOUT 300)

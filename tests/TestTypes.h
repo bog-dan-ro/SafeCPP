@@ -1,6 +1,6 @@
 #pragma once
 
-#include "SafeC++.h"
+#include "SafeCpp.h"
 
 #include <atomic>
 #include <shared_mutex>
