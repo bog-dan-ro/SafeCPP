@@ -4,9 +4,19 @@
 #include <cassert>
 #include <optional>
 #include <shared_mutex>
+#include <type_traits>
 #include <utility>
 
 namespace safe {
+
+template<typename T, typename M = std::shared_mutex>
+class SharedPtr;
+
+template<typename T, typename M = std::shared_mutex>
+class WeakPtr;
+
+template<typename T, typename M = std::shared_mutex>
+class CopyOnWritePtr;
 
 template<typename T, typename M>
 class [[nodiscard]] SharedLockGuard
@@ -86,6 +96,12 @@ public:
 };
 
 namespace __Internal__ {
+// Tags selecting the cast performed by the pointer converting constructors
+struct StaticCastTag
+{};
+struct DynamicCastTag
+{};
+
 struct ControlBlockBase
 {
     std::atomic<size_t> sharedRefs{1};
@@ -148,9 +164,15 @@ struct ControlBlock : public ControlBlockBase
 };
 } // namespace __Internal__
 
-template<typename T, typename M = std::shared_mutex>
+template<typename T, typename M>
 class SharedPtr
 {
+    template<typename, typename>
+    friend class SharedPtr;
+
+    template<typename, typename>
+    friend class WeakPtr;
+
 protected:
     __Internal__::ControlBlockBase *m_cb{nullptr};
     T *m_data{nullptr};
@@ -190,6 +212,50 @@ public:
         , m_mutex(std::exchange(other.m_mutex, nullptr))
     {}
 
+    // Implicit conversion to a compatible pointer type (e.g. Derived -> Base)
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    SharedPtr(const SharedPtr<U, M> &other) noexcept
+        : m_cb(other.m_cb)
+        , m_data(static_cast<T *>(other.m_data))
+        , m_mutex(other.m_mutex)
+    {
+        if (m_cb)
+            m_cb->addShared();
+    }
+
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    SharedPtr(SharedPtr<U, M> &&other) noexcept
+        : m_cb(std::exchange(other.m_cb, nullptr))
+        , m_data(static_cast<T *>(std::exchange(other.m_data, nullptr)))
+        , m_mutex(std::exchange(other.m_mutex, nullptr))
+    {}
+
+    // Used by safe::staticCast(), shares ownership with other
+    template<typename U>
+    SharedPtr(const SharedPtr<U, M> &other, __Internal__::StaticCastTag) noexcept
+        : m_cb(other.m_cb)
+        , m_data(static_cast<T *>(other.m_data))
+        , m_mutex(other.m_mutex)
+    {
+        if (m_cb)
+            m_cb->addShared();
+    }
+
+    // Used by safe::dynamicCast(), empty if the cast fails
+    template<typename U>
+    SharedPtr(const SharedPtr<U, M> &other, __Internal__::DynamicCastTag) noexcept
+        : m_data(dynamic_cast<T *>(other.m_data))
+    {
+        if (m_data) {
+            m_cb = other.m_cb;
+            m_mutex = other.m_mutex;
+            if (m_cb)
+                m_cb->addShared();
+        }
+    }
+
     virtual ~SharedPtr() { release(); }
 
     SharedPtr &operator=(const SharedPtr &other) noexcept
@@ -216,6 +282,30 @@ public:
         return *this;
     }
 
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    SharedPtr &operator=(const SharedPtr<U, M> &other) noexcept
+    {
+        release();
+        m_cb = other.m_cb;
+        m_data = static_cast<T *>(other.m_data);
+        m_mutex = other.m_mutex;
+        if (m_cb)
+            m_cb->addShared();
+        return *this;
+    }
+
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    SharedPtr &operator=(SharedPtr<U, M> &&other) noexcept
+    {
+        release();
+        m_cb = std::exchange(other.m_cb, nullptr);
+        m_data = static_cast<T *>(std::exchange(other.m_data, nullptr));
+        m_mutex = std::exchange(other.m_mutex, nullptr);
+        return *this;
+    }
+
     __Internal__::ControlBlockBase *controlBlock() const noexcept { return m_cb; }
 
     // Explicit Bool Operator to check if valid
@@ -233,25 +323,51 @@ public:
         return SharedLockGuard<T, M>(m_data, m_mutex);
     }
 };
-template<typename T, typename M = std::shared_mutex>
+
+// std::static_pointer_cast() equivalent
+template<typename T, typename U, typename M>
+[[nodiscard]] SharedPtr<T, M> staticCast(const SharedPtr<U, M> &other) noexcept
+{
+    return SharedPtr<T, M>(other, __Internal__::StaticCastTag{});
+}
+
+// std::dynamic_pointer_cast() equivalent, returns an empty pointer if the cast fails
+template<typename T, typename U, typename M>
+[[nodiscard]] SharedPtr<T, M> dynamicCast(const SharedPtr<U, M> &other) noexcept
+{
+    return SharedPtr<T, M>(other, __Internal__::DynamicCastTag{});
+}
+
+template<typename T, typename M>
 class WeakPtr
 {
+    template<typename, typename>
+    friend class WeakPtr;
+
 private:
     __Internal__::ControlBlockBase *m_cb{nullptr};
+    T *m_data{nullptr};
+    M *m_mutex{nullptr};
 
     void release() noexcept
     {
         if (m_cb) {
             m_cb->releaseWeak();
             m_cb = nullptr;
+            m_data = nullptr;
+            m_mutex = nullptr;
         }
     }
 
 public:
     WeakPtr() = default;
 
-    WeakPtr(const SharedPtr<T, M> &shared) noexcept
-        : m_cb(shared.controlBlock())
+    template<typename U>
+        requires std::is_convertible_v<U *, T *>
+    WeakPtr(const SharedPtr<U, M> &shared) noexcept
+        : m_cb(shared.m_cb)
+        , m_data(static_cast<T *>(shared.m_data))
+        , m_mutex(shared.m_mutex)
     {
         if (m_cb)
             m_cb->addWeak();
@@ -259,6 +375,20 @@ public:
 
     WeakPtr(const WeakPtr &other) noexcept
         : m_cb(other.m_cb)
+        , m_data(other.m_data)
+        , m_mutex(other.m_mutex)
+    {
+        if (m_cb)
+            m_cb->addWeak();
+    }
+
+    // Implicit conversion to a compatible pointer type (e.g. Derived -> Base)
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    WeakPtr(const WeakPtr<U, M> &other) noexcept
+        : m_cb(other.m_cb)
+        , m_data(static_cast<T *>(other.m_data))
+        , m_mutex(other.m_mutex)
     {
         if (m_cb)
             m_cb->addWeak();
@@ -266,6 +396,8 @@ public:
 
     WeakPtr(WeakPtr &&other) noexcept
         : m_cb(std::exchange(other.m_cb, nullptr))
+        , m_data(std::exchange(other.m_data, nullptr))
+        , m_mutex(std::exchange(other.m_mutex, nullptr))
     {}
 
     ~WeakPtr() { release(); }
@@ -275,16 +407,35 @@ public:
         if (this != &other) {
             release();
             m_cb = other.m_cb;
+            m_data = other.m_data;
+            m_mutex = other.m_mutex;
             if (m_cb)
                 m_cb->addWeak();
         }
         return *this;
     }
 
-    WeakPtr &operator=(const SharedPtr<T, M> &shared) noexcept
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    WeakPtr &operator=(const WeakPtr<U, M> &other) noexcept
     {
         release();
-        m_cb = shared.controlBlock();
+        m_cb = other.m_cb;
+        m_data = static_cast<T *>(other.m_data);
+        m_mutex = other.m_mutex;
+        if (m_cb)
+            m_cb->addWeak();
+        return *this;
+    }
+
+    template<typename U>
+        requires std::is_convertible_v<U *, T *>
+    WeakPtr &operator=(const SharedPtr<U, M> &shared) noexcept
+    {
+        release();
+        m_cb = shared.m_cb;
+        m_data = static_cast<T *>(shared.m_data);
+        m_mutex = shared.m_mutex;
         if (m_cb)
             m_cb->addWeak();
         return *this;
@@ -297,10 +448,10 @@ public:
 
     SharedPtr<T, M> lock() const noexcept
     {
-        if (m_cb && m_cb->tryAddShared()) {
-            auto *concreteCb = static_cast<__Internal__::ControlBlock<T, M> *>(m_cb);
-            return SharedPtr<T, M>(m_cb, &(*concreteCb->data), &concreteCb->mutex);
-        }
+        // The data pointer stays valid as long as a shared owner exists, and
+        // tryAddShared() only succeeds while T is still alive.
+        if (m_cb && m_cb->tryAddShared())
+            return SharedPtr<T, M>(m_cb, m_data, m_mutex);
         return SharedPtr<T, M>{};
     }
 };
@@ -312,10 +463,12 @@ SharedPtr<T, M> makeShared(Args &&...args)
     return SharedPtr<T, M>(cb, &(*cb->data), &cb->mutex);
 }
 
-template<typename T, typename M = std::shared_mutex>
+template<typename T, typename M>
 class CopyOnWritePtr : public SharedPtr<T, M>
 {
 private:
+    // Note: T is what gets cloned, so holding a base pointer to a derived object
+    // (e.g. after an up-cast) slices the object on the first detach().
     void detach()
     {
         if (!this->m_cb)
