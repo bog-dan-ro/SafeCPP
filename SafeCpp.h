@@ -418,6 +418,12 @@ public:
         return UniqueLockGuard<T, M>(m_cb, m_data);
     }
 
+    virtual UniqueLockGuard<T, M> writeLock() const
+    {
+        assert(m_data != nullptr && "SharedPtr is null!");
+        return UniqueLockGuard<T, M>(m_cb, m_data);
+    }
+
     SharedLockGuard<T, M> readLock() const
     {
         assert(m_data != nullptr && "SharedPtr is null!");
