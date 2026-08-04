@@ -412,11 +412,6 @@ public:
     // Explicit Bool Operator to check if valid
     explicit operator bool() const noexcept { return m_cb != nullptr; }
 
-    // Named writeLock/readLock rather than lock/sharedLock: WeakPtr::lock() means
-    // something completely different (promote to an owner), and one library should
-    // not use the same verb for two unrelated operations.
-    // Virtual so that a CopyOnWritePtr reached through a SharedPtr reference still
-    // detaches instead of silently writing to the shared object
     virtual UniqueLockGuard<T, M> writeLock()
     {
         assert(m_data != nullptr && "SharedPtr is null!");
@@ -700,6 +695,8 @@ protected:
 public:
     [[nodiscard]] SharedPtr<T, M> sharedFromThis() const noexcept { return m_weakThis.lock(); }
     [[nodiscard]] WeakPtr<T, M> weakFromThis() const noexcept { return m_weakThis; }
+    [[nodiscard]] SharedPtr<T, M> sharedFromThis() noexcept { return m_weakThis.lock(); }
+    [[nodiscard]] WeakPtr<T, M> weakFromThis() noexcept { return m_weakThis; }
 };
 
 namespace detail {
