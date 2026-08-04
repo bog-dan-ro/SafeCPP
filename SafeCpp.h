@@ -33,6 +33,9 @@ class WeakPtr;
 template<typename T, SharedMutex M = std::shared_mutex>
 class CopyOnWritePtr;
 
+template<typename T, SharedMutex M = std::shared_mutex>
+class EnableSharedFromThis;
+
 template<typename T, SharedMutex M = std::shared_mutex, typename... Args>
 SharedPtr<T, M> makeShared(Args &&...args);
 
@@ -622,6 +625,12 @@ namespace detail {
 template<typename T, SharedMutex M>
 void armSharedFromThis(const SharedPtr<T, M> &owner, T *object) noexcept;
 
+template<SharedMutex M, typename U>
+EnableSharedFromThis<U, M> *esftBaseOf(const EnableSharedFromThis<U, M> *) noexcept;
+
+template<typename T, typename M>
+concept HasSharedFromThis = SharedMutex<M> && requires(T *object) { esftBaseOf<M>(object); };
+
 template<typename P>
 struct IsPlainSharedPtr : std::false_type
 {};
@@ -700,7 +709,7 @@ template<typename... Ptrs>
 // you have is a T&, and this is the way back to a pointer.
 // The returned pointer is *not* locked, and the mutex is not recursive: locking it
 // again while still inside the critical section deadlocks.
-template<typename T, SharedMutex M = std::shared_mutex>
+template<typename T, SharedMutex M>
 class EnableSharedFromThis
 {
     template<typename U, SharedMutex Mx>
@@ -728,8 +737,11 @@ namespace detail {
 template<typename T, SharedMutex M>
 void armSharedFromThis(const SharedPtr<T, M> &owner, T *object) noexcept
 {
-    if constexpr (std::derived_from<T, EnableSharedFromThis<T, M>>)
-        static_cast<EnableSharedFromThis<T, M> *>(object)->m_weakThis = owner;
+    if constexpr (HasSharedFromThis<T, M>) {
+        // EnableSharedFromThis<U, M>, with U deduced from the base rather than from T
+        using EsftBase = std::remove_pointer_t<decltype(esftBaseOf<M>(object))>;
+        static_cast<EsftBase *>(object)->m_weakThis = owner;
+    }
 }
 } // namespace detail
 

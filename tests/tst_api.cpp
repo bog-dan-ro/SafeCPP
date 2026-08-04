@@ -17,6 +17,50 @@ struct Node : safe::EnableSharedFromThis<Node>
     {}
 };
 
+// The back reference has to survive inheritance: makeShared() is handed the most derived
+// type, while EnableSharedFromThis sits on a base and is parameterised on that base.
+struct DerivedNode : Node
+{
+    int extra = 0;
+
+    explicit DerivedNode(int value = 0, int extra = 0)
+        : Node(value)
+        , extra(extra)
+    {}
+};
+
+struct GrandChildNode : DerivedNode
+{
+    using DerivedNode::DerivedNode;
+};
+
+// Declared with a non default mutex
+struct TimedNode : safe::EnableSharedFromThis<TimedNode, std::shared_timed_mutex>
+{
+    int value = 0;
+};
+
+struct DerivedTimedNode : TimedNode
+{};
+
+// No back reference at all, must still be constructible
+struct PlainNode
+{
+    int value = 0;
+};
+
+// Inaccessible base, treated as if there were no base at all
+struct PrivateNode : private safe::EnableSharedFromThis<PrivateNode>
+{
+    int value = 0;
+};
+
+// Two back references, ambiguous, so neither is armed
+struct AmbiguousNode : safe::EnableSharedFromThis<Node>, safe::EnableSharedFromThis<PlainNode>
+{
+    int value = 0;
+};
+
 } // namespace
 
 TEST(Api, exposesElementAndMutexTypes)
@@ -169,6 +213,94 @@ TEST(Api, sharedFromThisIsEmptyForAnUnownedObject)
 {
     Node stackNode(1);
     CHECK(!stackNode.sharedFromThis());
+}
+
+TEST(Api, sharedFromThisIsArmedForADerivedType)
+{
+    auto node = safe::makeShared<DerivedNode>(5, 7);
+
+    auto self = node.readLock()->sharedFromThis(); // safe::SharedPtr<Node>, the base
+    REQUIRE(bool(self));
+    CHECK(self == node); // same control block, so the two compare equal
+    CHECK_EQ(self.readLock()->value, 5);
+    CHECK_EQ(self.useCount(), size_t(2)); // node and self, the guard has gone
+
+    auto weak = node.readLock()->weakFromThis();
+    CHECK(!weak.expired());
+    CHECK(weak.lock() == node);
+}
+
+TEST(Api, sharedFromThisIsArmedThroughAnIndirectBase)
+{
+    auto node = safe::makeShared<GrandChildNode>(3, 4);
+
+    auto self = node.readLock()->sharedFromThis();
+    REQUIRE(bool(self));
+    CHECK(self == node);
+    CHECK_EQ(self.readLock()->value, 3);
+}
+
+TEST(Api, sharedFromThisDoesNotAddAnOwnerOfItsOwn)
+{
+    // The back reference is weak, so an armed object must not keep itself alive
+    auto node = safe::makeShared<DerivedNode>(1, 2);
+    CHECK_EQ(node.useCount(), size_t(1));
+    CHECK_EQ(node.weakCount(), size_t(2)); // the owners collectively, plus m_weakThis
+
+    safe::WeakPtr<Node> observer = node.readLock()->weakFromThis();
+    CHECK(!observer.expired());
+    node.reset();
+    CHECK(observer.expired());
+}
+
+TEST(Api, sharedFromThisIsArmedForADerivedTypeWithANonDefaultMutex)
+{
+    auto node = safe::makeShared<DerivedTimedNode, std::shared_timed_mutex>();
+
+    auto self = node.readLock()->sharedFromThis();
+    REQUIRE(bool(self));
+    CHECK(self == node);
+}
+
+TEST(Api, sharedFromThisIsNotArmedWhenTheMutexDoesNotMatch)
+{
+    // The object asks for shared_timed_mutex, the pointer uses the default one, so this
+    // is not the base we are looking for and the back reference stays empty
+    auto node = safe::makeShared<DerivedTimedNode>();
+    CHECK(!node.readLock()->sharedFromThis());
+}
+
+TEST(Api, objectsWithoutABackReferenceStillWork)
+{
+    auto plain = safe::makeShared<PlainNode>();
+    plain.writeLock()->value = 9;
+    CHECK_EQ(plain.readLock()->value, 9);
+
+    // An inaccessible or ambiguous base is simply not armed, exactly like the standard
+    // enable_shared_from_this, and must not make makeShared() ill formed
+    auto hidden = safe::makeShared<PrivateNode>();
+    hidden.writeLock()->value = 8;
+    CHECK_EQ(hidden.readLock()->value, 8);
+
+    auto ambiguous = safe::makeShared<AmbiguousNode>();
+    ambiguous.writeLock()->value = 7;
+    CHECK_EQ(ambiguous.readLock()->value, 7);
+}
+
+TEST(Api, sharedFromThisFollowsACopyOnWriteDetachOfADerivedType)
+{
+    auto original = safe::makeCopyOnWrite<DerivedNode>(1, 2);
+    auto copy = original;
+
+    copy.writeLock()->value = 3; // detaches onto a fresh block
+
+    auto self = copy.readLock()->sharedFromThis();
+    REQUIRE(bool(self));
+    CHECK(self == copy); // the clone points at itself, not at the original
+    CHECK(!(self == original));
+    CHECK_EQ(self.readLock()->value, 3);
+
+    CHECK(original.readLock()->sharedFromThis() == original);
 }
 
 TEST(ScopedLock, locksSeveralPointersAtOnce)
