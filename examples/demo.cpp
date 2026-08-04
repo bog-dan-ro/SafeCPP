@@ -6,6 +6,8 @@
 #include <print>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace std;
@@ -157,6 +159,38 @@ void manyThreads()
     println("  8 threads x 1000 increments = {}", *counter.readLock());
 }
 
+void unorderedContainers()
+{
+    println("Pointers as keys:");
+
+    auto first = safe::makeShared<string>("first");
+    auto second = safe::makeShared<string>("second");
+    auto absent = safe::makeShared<string>("absent");
+
+    // Hashing is by owner, like ==, so a copy of a pointer finds the same entry
+    unordered_set<safe::SharedPtr<string>> owners{first, second};
+    println("  contains first {}, second {}, absent {}",
+            owners.contains(first),
+            owners.contains(second),
+            owners.contains(absent));
+
+    // A WeakPtr hashes the same object to the same bucket, and keeps its hash
+    // once the object is gone, so an expired observer is still findable
+    unordered_map<safe::WeakPtr<string>, int> visits;
+    safe::WeakPtr<string> observer;
+    {
+        auto shortLived = safe::makeShared<string>("short lived");
+        observer = shortLived;
+        visits[observer] = 7;
+        println("  observer and owner hash alike {}",
+                hash<safe::WeakPtr<string>>{}(observer)
+                    == hash<safe::SharedPtr<string>>{}(shortLived));
+    }
+    println("  observer expired {}, entry still found {}",
+            observer.expired(),
+            visits.contains(observer));
+}
+
 } // namespace
 
 int main()
@@ -168,5 +202,6 @@ int main()
     severalObjectsAtOnce();
     pointerFromInsideTheObject();
     manyThreads();
+    unorderedContainers();
     return 0;
 }

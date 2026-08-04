@@ -11,6 +11,7 @@ add_executable(SafeCppTests
     tst_casts.cpp
     tst_copy_on_write.cpp
     tst_threading.cpp
+    tst_hash.cpp
     ../SafeCpp.h
 )
 
@@ -21,7 +22,7 @@ target_link_libraries(SafeCppTests PRIVATE Safe::CPP Threads::Threads)
 target_compile_features(SafeCppTests PRIVATE cxx_std_23)
 
 # One CTest entry per suite, the binary takes the suite name as its filter
-foreach(suite SharedPtr WeakPtr Cast CopyOnWrite Api ScopedLock Threading)
+foreach(suite SharedPtr WeakPtr Cast CopyOnWrite Api ScopedLock Threading Hash)
     add_test(NAME ${suite} COMMAND SafeCppTests ${suite})
     # Make a sanitizer report fail the test instead of only printing a warning
     # a deadlock must fail the run instead of hanging it

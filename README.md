@@ -148,6 +148,26 @@ struct Session : safe::EnableSharedFromThis<Session>
 };
 ```
 
+### Pointers as keys
+
+`==`, `<=>` and `std::hash` all work on the *owner*, the object identity, never on
+the value. So the pointers drop into both the ordered and the unordered containers,
+and every view of the same object — a copy, a `WeakPtr`, a pointer up-cast to a base
+— is the same key:
+
+```cpp
+std::unordered_set<safe::SharedPtr<Session>> live{session};
+live.contains(session);                        // true for any copy of it
+
+std::unordered_map<safe::WeakPtr<Session>, Stats> perSession;
+```
+
+A `WeakPtr` keeps its hash after the object dies, so an expired observer still finds
+its entry and can be erased. `CopyOnWritePtr` is deliberately *not* hashable:
+detaching moves it to a fresh control block, so a key already in a container would
+silently stop matching it. Convert it to a `SharedPtr` if you want to key on the
+object it owns right now.
+
 ### Bringing your own mutex
 
 The second template parameter is any type satisfying `safe::SharedMutex`
@@ -169,6 +189,7 @@ auto pointer = safe::makeShared<Config, MyTracingMutex>();
 | `staticCast` / `dynamicCast` / `constCast` | share the control block |
 | `useCount()` / `weakCount()` / `owner()` | owners, observers, identity |
 | `reset()` / `swap()` / `==` / `<=>` | ownership comparison, ordered container friendly |
+| `std::hash<SharedPtr/WeakPtr>` | hashes the owner, unordered container friendly |
 | `EnableSharedFromThis<T>` | `sharedFromThis()`, `weakFromThis()` |
 
 ## Things it deliberately does not do

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cassert>
 #include <compare>
@@ -579,6 +578,26 @@ public:
         std::swap(m_data, other.m_data);
     }
 
+    // Ownership comparison, like SharedPtr. Two observers of the same object
+    // compare equal even if they watch it through different base classes, and
+    // an expired observer keeps comparing equal to its peers.
+    template<typename U>
+    bool operator==(const WeakPtr<U, M> &other) const noexcept
+    {
+        return m_cb == other.m_cb;
+    }
+
+    template<typename U>
+    std::strong_ordering operator<=>(const WeakPtr<U, M> &other) const noexcept
+    {
+        return std::compare_three_way{}(m_cb, other.m_cb);
+    }
+
+    // Identity of the observed object, comparable with SharedPtr::owner().
+    // Stays the same once the object is gone, so an expired observer is still
+    // findable in a container.
+    const void *owner() const noexcept { return m_cb; }
+
     std::size_t useCount() const noexcept
     {
         return m_cb ? m_cb->sharedRefs.load(std::memory_order_relaxed) : 0;
@@ -798,3 +817,33 @@ CopyOnWritePtr<T, M> makeCopyOnWrite(Args &&...args)
 }
 
 } // namespace safe
+
+// Hashing is by owner, exactly like ==, so the pointers work as keys in the
+// unordered containers. A SharedPtr and a WeakPtr to the same object hash the
+// same, and an expired WeakPtr keeps the hash it had.
+//
+// CopyOnWritePtr is deliberately left unhashable: detaching moves it to a fresh
+// control block, so a key already sitting in a container would silently stop
+// matching the pointer it was made from. Convert it to a SharedPtr, and mean it,
+// if you want to key on the object it owns right now.
+namespace std {
+
+template<typename T, safe::SharedMutex M>
+struct hash<safe::SharedPtr<T, M>>
+{
+    std::size_t operator()(const safe::SharedPtr<T, M> &pointer) const noexcept
+    {
+        return std::hash<const void *>{}(pointer.owner());
+    }
+};
+
+template<typename T, safe::SharedMutex M>
+struct hash<safe::WeakPtr<T, M>>
+{
+    std::size_t operator()(const safe::WeakPtr<T, M> &pointer) const noexcept
+    {
+        return std::hash<const void *>{}(pointer.owner());
+    }
+};
+
+} // namespace std
