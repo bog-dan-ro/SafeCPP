@@ -227,4 +227,4 @@ importing SafeCpp costs you nothing but the header.
 
 ## License
 
-CC0 1.0 Universal. See [LICENSE](LICENSE).
+MIT-0. See [LICENSE](LICENSE).
