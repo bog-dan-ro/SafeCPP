@@ -18,7 +18,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
 // A short tour of SafeCpp. Each section is independent, build and run it to see
-// the output. The library needs C++20, this demo needs C++23 for <print>.
+// the output. The library and this demo require C++23.
 
 #include <SafeCpp.h>
 

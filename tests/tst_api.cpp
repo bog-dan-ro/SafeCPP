@@ -80,6 +80,70 @@ struct AmbiguousNode : safe::EnableSharedFromThis<Node>, safe::EnableSharedFromT
     int value = 0;
 };
 
+struct ConstexprBase
+{
+    virtual constexpr ~ConstexprBase() = default;
+};
+
+struct ConstexprDerived : ConstexprBase
+{};
+
+struct ConstexprNode : safe::EnableSharedFromThis<ConstexprNode>
+{};
+
+constexpr bool emptySharedPointerApi()
+{
+    safe::SharedPtr<int> first;
+    safe::SharedPtr<int> second{nullptr};
+    safe::SharedPtr<int> copy(first);
+    safe::SharedPtr<int> moved(std::move(copy));
+
+    second = first;
+    moved = std::move(second);
+    first = nullptr;
+    first.reset();
+    swap(first, moved);
+
+    safe::SharedPtr<const int> readOnly = first;
+    auto writable = safe::constCast<int>(readOnly);
+    safe::SharedPtr<ConstexprBase> base;
+    auto derived = safe::staticCast<ConstexprDerived>(base);
+    auto dynamic = safe::dynamicCast<ConstexprDerived>(base);
+
+    return !first && !second && !copy && !moved && !readOnly && !writable && !derived
+           && !dynamic && safe::getDeleter<int>(first) == nullptr
+           && first.owner() == nullptr && first.useCount() == 0 && first.weakCount() == 0
+           && (first <=> moved) == std::strong_ordering::equal;
+}
+
+constexpr bool emptyWeakPointerApi()
+{
+    safe::SharedPtr<int> shared;
+    safe::WeakPtr<int> first(shared);
+    safe::WeakPtr<int> copy(first);
+    safe::WeakPtr<int> moved(std::move(copy));
+
+    copy = first;
+    moved = std::move(copy);
+    first.reset();
+    swap(first, moved);
+
+    auto locked = moved.lock();
+    return first.expired() && moved.expired() && !locked && first.owner() == nullptr
+           && first.useCount() == 0 && (first <=> moved) == std::strong_ordering::equal;
+}
+
+constexpr bool emptyCopyOnWriteAndSharedFromThisApi()
+{
+    safe::CopyOnWritePtr<int> copyOnWrite;
+    ConstexprNode node;
+    return !copyOnWrite && !node.sharedFromThis() && node.weakFromThis().expired();
+}
+
+static_assert(emptySharedPointerApi());
+static_assert(emptyWeakPointerApi());
+static_assert(emptyCopyOnWriteAndSharedFromThisApi());
+
 } // namespace
 
 TEST(Api, exposesElementAndMutexTypes)

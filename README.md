@@ -1,6 +1,6 @@
 # SafeCpp
 
-Thread safe smart pointers for C++20. A single header, `SafeCpp.h`.
+Thread safe smart pointers for C++23. A single header, `SafeCpp.h`.
 
 ## What it solves
 
@@ -30,9 +30,7 @@ Forgetting to lock stops being a code review problem and becomes a compile error
 
 ## Requirements
 
-A C++20 compiler and CMake 3.16+. The library itself uses nothing newer: concepts,
-three way comparison and ranges. Only the demo and the test suite need C++23, for
-`<print>`, and they ask for it themselves.
+A C++23 compiler and CMake 3.16+.
 
 ## Import it
 
@@ -47,8 +45,8 @@ target_link_libraries(myapp PUBLIC Safe::CPP)
 ```
 
 Or install it and use `find_package(SafeCpp 1.0 REQUIRED)`, which gives you the same
-`Safe::CPP` target. Either way the C++20 requirement travels with the target, so you
-do not need to set `CMAKE_CXX_STANDARD` yourself, and a C++20 project stays C++20.
+`Safe::CPP` target. Either way the C++23 requirement travels with the target, so you
+do not need to set `CMAKE_CXX_STANDARD` yourself.
 
 ```cpp
 #include <SafeCpp.h>
@@ -178,15 +176,76 @@ The second template parameter is any type satisfying `safe::SharedMutex`
 auto pointer = safe::makeShared<Config, MyTracingMutex>();
 ```
 
+### Aliasing a protected subobject
+
+An alias shares the owner's control block and mutex while exposing a subobject. The
+alias must stay within the owner's lifetime, and that mutex must legitimately protect
+the aliased address.
+
+```cpp
+auto config = safe::makeShared<Config>();
+int *retries = nullptr;
+{
+    auto guard = config.writeLock();
+    retries = &guard->retries;
+}
+
+safe::SharedPtr<int> retryCount(config, retries);
+*retryCount.writeLock() = 5;       // locks config's mutex
+```
+
+Unlike `std::shared_ptr`, SafeCpp deliberately rejects ownerless and null aliases:
+there would be no valid mutex-protected object for a lock guard to expose.
+
+### External ownership, deleters and allocators
+
+Raw-pointer construction adopts a non-null object. The deleter must be copyable and
+`noexcept`; an optional allocator controls allocation of the control block.
+
+```cpp
+auto config = safe::SharedPtr<Config>(
+    new Config,
+    [](Config *pointer) noexcept {
+        logDeletion(pointer);
+        delete pointer;
+    });
+```
+
+Pre-existing raw aliases are still the caller's responsibility: wrapping an object
+cannot force those aliases to use SafeCpp's mutex.
+
+`allocateShared` constructs the object and control block in one allocator-backed
+allocation:
+
+```cpp
+auto config = safe::allocateShared<Config>(MyPoolAllocator<std::byte>{pool});
+```
+
+`getDeleter<D>(pointer)` returns the stored deleter when its exact type is `D`, and
+continues to work through copies, conversions and aliases.
+
+### `constexpr` scope
+
+Empty and moved-from pointer states support `constexpr` construction, copying,
+moving, assignment, reset, swap, comparison, casts and ownership observers.
+
+Non-empty ownership remains runtime-only. `makeShared`, `allocateShared`, reference
+count operations and lock guards depend on allocation, atomics and mutex operations
+that cannot be constant-evaluated by this implementation.
+
 ## API at a glance
 
 | | |
 |---|---|
-| `makeShared<T>(args…)` / `makeCopyOnWrite<T>(args…)` | the only ways to create one |
+| `makeShared<T>(args…)` / `allocateShared<T>(allocator, args…)` | in-place construction |
+| `makeCopyOnWrite<T>(args…)` | constructs a copy-on-write pointer |
+| `SharedPtr(pointer[, deleter[, allocator]])` | adopts a non-null external object |
+| `SharedPtr(owner, alias)` | shares an owner while exposing a protected subobject |
 | `writeLock()` / `readLock()` | exclusive / shared guard, the only access to `T` |
 | `lockAll(a, b, …)` | deadlock free multi lock, `get<I>()` per object |
 | `WeakPtr::lock()` / `expired()` | promote to an owner / cheap check |
 | `staticCast` / `dynamicCast` / `constCast` | share the control block |
+| `getDeleter<D>(pointer)` | query an externally supplied deleter |
 | `useCount()` / `weakCount()` / `owner()` | owners, observers, identity |
 | `reset()` / `swap()` / `==` / `<=>` | ownership comparison, ordered container friendly |
 | `std::hash<SharedPtr/WeakPtr>` | hashes the owner, unordered container friendly |
@@ -202,7 +261,8 @@ auto pointer = safe::makeShared<Config, MyTracingMutex>();
   a reference after the guard is gone. No C++ library can prevent that; it needs a
   borrow checker.
 - Cycles leak, exactly as with `std::shared_ptr`. Break them with `WeakPtr`.
-- No array support, aliasing constructor, custom deleters or allocators.
+- No array support. `SharedPtr<T[]>` and `SharedPtr<T[N]>` need array-specific
+  lock guards and counted storage rather than an unlocked `operator[]`.
 
 ## Building and testing
 

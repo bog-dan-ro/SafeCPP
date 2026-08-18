@@ -23,10 +23,8 @@ option(SAFECPP_INSTALL "Generate the install and package rules" ${SAFECPP_IS_TOP
 add_library(SafeCpp INTERFACE)
 add_library(Safe::CPP ALIAS SafeCpp)
 
-# The header itself only needs C++20 (concepts, three way comparison, ranges).
-# Requiring more would push a needless constraint onto every consumer: only the
-# examples and the tests need C++23, and they ask for it themselves.
-target_compile_features(SafeCpp INTERFACE cxx_std_20)
+# C++23 is the public baseline for the library and all consumers.
+target_compile_features(SafeCpp INTERFACE cxx_std_23)
 
 target_include_directories(SafeCpp INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
