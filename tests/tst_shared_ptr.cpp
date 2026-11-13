@@ -20,7 +20,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "TestHarness.h"
 #include "TestTypes.h"
 
+#include <memory>
 #include <utility>
+#include <vector>
 
 using namespace tst;
 
@@ -117,6 +119,38 @@ TEST(SharedPtr, selfAssignmentKeepsTheObjectAlive)
     pointer = std::move(alias);
     CHECK_EQ(Tracked::alive.load(), 1);
     CHECK_EQ(pointer.readLock()->value, 3);
+}
+
+TEST(SharedPtr, indirectSelfAssignmentDoesNotDestroyTheSourceBeforeCopying)
+{
+    struct Chain
+    {
+        Tracked tracked;
+        safe::SharedPtr<Chain> next;
+
+        explicit Chain(int value)
+            : tracked(value)
+        {}
+    };
+
+    Tracked::resetCounters();
+    {
+        auto head = safe::makeShared<Chain>(1);
+        const safe::SharedPtr<Chain> *nextAddress = nullptr;
+        {
+            auto guard = head.writeLock();
+            guard->next = safe::makeShared<Chain>(2);
+            nextAddress = &guard->next;
+        }
+        CHECK_EQ(Tracked::alive.load(), 2);
+
+        // head is the sole owner of *nextAddress; releasing head before copying
+        // *nextAddress would destroy *nextAddress mid-assignment.
+        head = *nextAddress;
+        CHECK_EQ(Tracked::alive.load(), 1);
+        CHECK_EQ(head.readLock()->tracked.value, 2);
+    }
+    CHECK_EQ(Tracked::alive.load(), 0);
 }
 
 TEST(SharedPtr, destroysTheObjectWithTheLastOwner)
@@ -260,4 +294,46 @@ TEST(SharedPtr, movedGuardReleasesItsReferenceExactlyOnce)
         CHECK_EQ(sharedCount(pointer), size_t(2));
     }
     CHECK_EQ(sharedCount(pointer), size_t(1));
+}
+
+namespace {
+
+// std::is_copy_constructible is true for this type, yet copying it does not
+// compile: the trait only sees the declaration of the vector's copy constructor
+struct DeepOwner
+{
+    std::vector<std::unique_ptr<int>> values;
+};
+static_assert(std::is_copy_constructible_v<DeepOwner>);
+
+} // namespace
+
+TEST(SharedPtr, doesNotNeedACopyConstructor)
+{
+    // Copying is a CopyOnWritePtr concern. None of these may instantiate a copy
+    // constructor, which for DeepOwner is a hard compile error.
+    auto made = safe::makeShared<DeepOwner>();
+    made.writeLock()->values.push_back(std::make_unique<int>(7));
+    CHECK_EQ(*made.readLock()->values.front(), 7);
+
+    safe::SharedPtr<DeepOwner> adopted(new DeepOwner);
+    CHECK(adopted.readLock()->values.empty());
+
+    auto allocated = safe::allocateShared<DeepOwner>(std::allocator<std::byte>{});
+    CHECK(allocated.readLock()->values.empty());
+
+    auto moveOnly = safe::makeShared<MoveOnly>(3);
+    CHECK_EQ(moveOnly.readLock()->value, 3);
+}
+
+TEST(SharedPtr, ownsAnIncompleteTypeThroughACustomDeleter)
+{
+    {
+        safe::SharedPtr<Opaque> handle(createOpaque(11),
+                                       [](Opaque *opaque) noexcept { destroyOpaque(opaque); });
+        auto copy = handle;
+        CHECK_EQ(opaqueAlive(), 1);
+        CHECK_EQ(opaqueValue(&*copy.readLock()), 11);
+    }
+    CHECK_EQ(opaqueAlive(), 0);
 }

@@ -4,6 +4,7 @@ find_package(Threads REQUIRED)
 add_executable(SafeCppTests
     TestHarness.h
     TestTypes.h
+    OpaqueHandle.cpp
     main.cpp
     tst_api.cpp
     tst_aliasing.cpp

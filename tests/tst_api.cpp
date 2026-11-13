@@ -53,6 +53,31 @@ struct GrandChildNode : DerivedNode
     using DerivedNode::DerivedNode;
 };
 
+struct PolymorphicNode : safe::EnableSharedFromThis<PolymorphicNode>
+{
+    virtual ~PolymorphicNode() = default;
+    int value = 0;
+
+    explicit PolymorphicNode(int value = 0)
+        : value(value)
+    {}
+};
+
+struct DerivedPolymorphicNode : PolymorphicNode
+{
+    int extra = 0;
+
+    explicit DerivedPolymorphicNode(int value = 0, int extra = 0)
+        : PolymorphicNode(value)
+        , extra(extra)
+    {}
+};
+
+struct DerivedEsftOnly : Base, safe::EnableSharedFromThis<DerivedEsftOnly>
+{
+    int extra = 9;
+};
+
 // Declared with a non default mutex
 struct TimedNode : safe::EnableSharedFromThis<TimedNode, std::shared_timed_mutex>
 {
@@ -136,8 +161,17 @@ constexpr bool emptyWeakPointerApi()
 constexpr bool emptyCopyOnWriteAndSharedFromThisApi()
 {
     safe::CopyOnWritePtr<int> copyOnWrite;
+    safe::CopyOnWritePtr<int> fromNull{nullptr};
+    safe::CopyOnWritePtr<ConstexprDerived> derivedCow;
+    safe::CopyOnWritePtr<ConstexprBase> baseCow(derivedCow);
+    safe::CopyOnWritePtr<ConstexprBase> movedBaseCow(std::move(derivedCow));
+    baseCow = movedBaseCow;
+    baseCow = std::move(movedBaseCow);
+    baseCow = nullptr;
+
     ConstexprNode node;
-    return !copyOnWrite && !node.sharedFromThis() && node.weakFromThis().expired();
+    return !copyOnWrite && !fromNull && !derivedCow && !baseCow && !movedBaseCow
+           && !node.sharedFromThis() && node.weakFromThis().expired();
 }
 
 static_assert(emptySharedPointerApi());
@@ -384,6 +418,50 @@ TEST(Api, sharedFromThisFollowsACopyOnWriteDetachOfADerivedType)
     CHECK_EQ(self.readLock()->value, 3);
 
     CHECK(original.readLock()->sharedFromThis() == original);
+}
+
+TEST(Api, sharedFromThisFollowsADetachThroughABaseCopyOnWritePointer)
+{
+    safe::CopyOnWritePtr<PolymorphicNode> d1 =
+        safe::makeCopyOnWrite<DerivedPolymorphicNode>(1, 2);
+    auto d2 = d1;
+
+    {
+        auto lock1 = d1.readLock();
+        auto lock2 = d2.writeLock(); // detaches and clones DerivedPolymorphicNode
+        lock2->value = 3;
+    }
+
+    auto self1 = d1.readLock()->sharedFromThis();
+    auto self2 = d2.readLock()->sharedFromThis();
+    REQUIRE(bool(self1));
+    REQUIRE(bool(self2));
+    CHECK(self1 == d1);
+    CHECK(self2 == d2);
+    CHECK(!(self1 == self2));
+
+    auto derived2 = safe::dynamicCast<DerivedPolymorphicNode>(self2);
+    REQUIRE(bool(derived2));
+    CHECK(derived2 == d2);
+    CHECK_EQ(derived2.readLock()->value, 3);
+    CHECK_EQ(derived2.readLock()->extra, 2);
+}
+
+TEST(Api, sharedFromThisOnADerivedTypeSurvivesDetachThroughAnUnrelatedBase)
+{
+    safe::CopyOnWritePtr<Base> d1 = safe::makeCopyOnWrite<DerivedEsftOnly>();
+    auto d2 = d1;
+
+    d2.writeLock()->base = 42;
+
+    auto derived2 = safe::dynamicCast<DerivedEsftOnly>(d2);
+    REQUIRE(bool(derived2));
+    auto self2 = derived2.readLock()->sharedFromThis();
+    REQUIRE(bool(self2));
+    CHECK(self2 == d2);
+    CHECK(!(self2 == d1));
+    CHECK_EQ(self2.readLock()->base, 42);
+    CHECK_EQ(self2.readLock()->extra, 9);
 }
 
 TEST(ScopedLock, locksSeveralPointersAtOnce)

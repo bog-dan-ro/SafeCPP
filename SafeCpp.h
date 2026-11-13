@@ -25,9 +25,11 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <compare>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <new>
 #include <shared_mutex>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <typeinfo>
@@ -67,11 +69,28 @@ template<typename Deleter, typename T, SharedMutex M>
 constexpr Deleter *getDeleter(const SharedPtr<T, M> &pointer) noexcept;
 
 template<typename T, SharedMutex M = std::shared_mutex, typename... Args>
+    requires std::copy_constructible<T>
 CopyOnWritePtr<T, M> makeCopyOnWrite(Args &&...args);
 
+template<typename T, SharedMutex M = std::shared_mutex, typename Allocator, typename... Args>
+    requires std::copy_constructible<T>
+CopyOnWritePtr<T, M> allocateCopyOnWrite(const Allocator &allocator, Args &&...args);
+
+template<typename T, typename U, SharedMutex M>
+[[nodiscard]] constexpr SharedPtr<T, M> staticCast(const SharedPtr<U, M> &other) noexcept;
+
+template<typename T, typename U, SharedMutex M>
+[[nodiscard]] constexpr SharedPtr<T, M> dynamicCast(const SharedPtr<U, M> &other) noexcept;
+
+template<typename T, typename U, SharedMutex M>
+[[nodiscard]] constexpr SharedPtr<T, M> constCast(const SharedPtr<U, M> &other) noexcept;
+
 namespace detail {
-template<typename Owner, typename Object, SharedMutex M>
-void armSharedFromThis(const SharedPtr<Owner, M> &owner, Object *object) noexcept;
+template<SharedMutex M>
+struct ControlBlockBase;
+
+template<typename Object, SharedMutex M>
+void armSharedFromThis(ControlBlockBase<M> *cb, Object *object) noexcept;
 
 template<typename T>
 struct DefaultDelete
@@ -79,13 +98,12 @@ struct DefaultDelete
     void operator()(T *pointer) const noexcept { delete pointer; }
 };
 
-// Tags selecting the cast performed by the pointer converting constructors
-struct StaticCastTag
-{};
-struct DynamicCastTag
-{};
-struct ConstCastTag
-{};
+template<SharedMutex M>
+struct CloneResult
+{
+    ControlBlockBase<M> *cb{nullptr};
+    void *data{nullptr};
+};
 
 template<SharedMutex M>
 struct ControlBlockBase
@@ -100,6 +118,11 @@ struct ControlBlockBase
     virtual ~ControlBlockBase() = default;
     virtual void destroyData() noexcept = 0;
     virtual void destroySelf() noexcept = 0;
+    // Copies the owned object into a fresh block and returns it together with
+    // oldData moved over to the copy. Only the blocks created for a CopyOnWritePtr
+    // implement it: an empty result means "this block cannot clone", which keeps
+    // plain SharedPtr users from having to provide (or pay for) a copy constructor.
+    virtual CloneResult<M> clone([[maybe_unused]] const void *oldData) const { return {}; }
     virtual void *getDeleter(const std::type_info &) noexcept { return nullptr; }
 
     void addShared() noexcept { sharedRefs.fetch_add(1, std::memory_order_relaxed); }
@@ -173,36 +196,103 @@ public:
     }
 };
 
-template<typename T, SharedMutex M, typename Allocator>
-struct InplaceControlBlock final : ControlBlockBase<M>
+template<typename DerivedBlock, SharedMutex M, typename Allocator>
+struct AllocatedControlBlock : ControlBlockBase<M>
 {
     using BlockAllocator =
-        typename std::allocator_traits<Allocator>::template rebind_alloc<InplaceControlBlock>;
+        typename std::allocator_traits<Allocator>::template rebind_alloc<DerivedBlock>;
     using BlockTraits = std::allocator_traits<BlockAllocator>;
     using BlockPointer = typename BlockTraits::pointer;
 
     [[no_unique_address]] Allocator allocator;
     BlockPointer allocation;
+
+    AllocatedControlBlock(const Allocator &sourceAllocator, BlockPointer sourceAllocation)
+        : allocator(sourceAllocator)
+        , allocation(sourceAllocation)
+    {}
+
+    void destroySelf() noexcept final
+    {
+        BlockAllocator blockAllocator(allocator);
+        BlockPointer blockAllocation = allocation;
+        BlockTraits::destroy(blockAllocator, static_cast<DerivedBlock *>(this));
+        BlockTraits::deallocate(blockAllocator, blockAllocation, 1);
+    }
+};
+
+template<typename T, SharedMutex M, typename Allocator, bool Cloneable = false>
+struct InplaceControlBlock;
+
+template<typename T, SharedMutex M, typename Allocator, typename... Args>
+InplaceControlBlock<T, M, Allocator, true> *
+allocateCloneableControlBlock(const Allocator &allocator, Args &&...args);
+
+// True if address lies inside the object root points to
+template<typename U>
+bool pointsInto(const U *root, const void *address) noexcept
+{
+    const auto begin = reinterpret_cast<std::uintptr_t>(root);
+    const auto value = reinterpret_cast<std::uintptr_t>(address);
+    return value >= begin && value - begin < sizeof(U);
+}
+
+// Copies *oldRoot into a new cloneable block and translates oldData, which points
+// at oldRoot or at one of its subobjects, to the same place inside the copy.
+// Returns an empty result if oldData points outside of *oldRoot (an aliasing
+// pointer to something the root merely keeps alive): there is nothing in the copy
+// it could be translated to.
+template<typename U, SharedMutex M, typename Allocator>
+CloneResult<M> cloneObject(const Allocator &allocator, const U *oldRoot, const void *oldData)
+{
+    if (!pointsInto(oldRoot, oldData))
+        return {};
+
+    auto *newCb = allocateCloneableControlBlock<U, M>(allocator, *oldRoot);
+    const auto offset = static_cast<const std::byte *>(oldData)
+                        - reinterpret_cast<const std::byte *>(oldRoot);
+    auto *rawNewRoot = const_cast<std::remove_cv_t<U> *>(newCb->data.get());
+    return {newCb, reinterpret_cast<std::byte *>(rawNewRoot) + offset};
+}
+
+// The clone a CopyOnWritePtr falls back to when its block cannot clone itself:
+// copies the U at root, U being the static type of the pointer it was made from
+template<typename U, SharedMutex M>
+CloneResult<M> cloneStatic(const void *root, const void *oldData)
+{
+    return cloneObject<U, M>(std::allocator<std::byte>{}, static_cast<const U *>(root), oldData);
+}
+
+// Cloneable is only set for the blocks made by makeCopyOnWrite(),
+// allocateCopyOnWrite() and a detaching CopyOnWritePtr. Such a block knows the
+// complete type and the allocator of its object, so it clones without slicing.
+template<typename T, SharedMutex M, typename Allocator, bool Cloneable>
+struct InplaceControlBlock final
+    : AllocatedControlBlock<InplaceControlBlock<T, M, Allocator, Cloneable>, M, Allocator>
+{
+    using Base =
+        AllocatedControlBlock<InplaceControlBlock<T, M, Allocator, Cloneable>, M, Allocator>;
+    using typename Base::BlockPointer;
+
     ObjectStorage<T> data;
 
     template<typename... Args>
     explicit InplaceControlBlock(const Allocator &sourceAllocator,
                                  BlockPointer sourceAllocation,
                                  Args &&...args)
-        : allocator(sourceAllocator)
-        , allocation(sourceAllocation)
+        : Base(sourceAllocator, sourceAllocation)
     {
-        data.construct(allocator, std::forward<Args>(args)...);
+        data.construct(this->allocator, std::forward<Args>(args)...);
     }
 
-    void destroyData() noexcept override { data.destroy(allocator); }
+    void destroyData() noexcept override { data.destroy(this->allocator); }
 
-    void destroySelf() noexcept override
+    CloneResult<M> clone([[maybe_unused]] const void *oldData) const override
     {
-        BlockAllocator blockAllocator(allocator);
-        BlockPointer blockAllocation = allocation;
-        BlockTraits::destroy(blockAllocator, this);
-        BlockTraits::deallocate(blockAllocator, blockAllocation, 1);
+        if constexpr (Cloneable)
+            return cloneObject<T, M>(this->allocator, data.get(), oldData);
+        else
+            return {};
     }
 };
 
@@ -243,19 +333,29 @@ InplaceControlBlock<T, M, Allocator> *
 allocateInplaceControlBlock(const Allocator &allocator, Args &&...args)
 {
     using Block = InplaceControlBlock<T, M, Allocator>;
-    return allocateControlBlock<Block>(allocator, std::forward<Args>(args)...);
+    auto *cb = allocateControlBlock<Block>(allocator, std::forward<Args>(args)...);
+    armSharedFromThis(cb, cb->data.get());
+    return cb;
+}
+
+template<typename T, SharedMutex M, typename Allocator, typename... Args>
+InplaceControlBlock<T, M, Allocator, true> *
+allocateCloneableControlBlock(const Allocator &allocator, Args &&...args)
+{
+    using Block = InplaceControlBlock<T, M, Allocator, true>;
+    auto *cb = allocateControlBlock<Block>(allocator, std::forward<Args>(args)...);
+    armSharedFromThis(cb, cb->data.get());
+    return cb;
 }
 
 template<typename Y, SharedMutex M, typename Deleter, typename Allocator>
-struct ExternalControlBlock final : ControlBlockBase<M>
+struct ExternalControlBlock final
+    : AllocatedControlBlock<ExternalControlBlock<Y, M, Deleter, Allocator>, M, Allocator>
 {
-    using BlockAllocator =
-        typename std::allocator_traits<Allocator>::template rebind_alloc<ExternalControlBlock>;
-    using BlockTraits = std::allocator_traits<BlockAllocator>;
-    using BlockPointer = typename BlockTraits::pointer;
+    using Base =
+        AllocatedControlBlock<ExternalControlBlock<Y, M, Deleter, Allocator>, M, Allocator>;
+    using typename Base::BlockPointer;
 
-    [[no_unique_address]] Allocator allocator;
-    BlockPointer allocation;
     Y *pointer;
     [[no_unique_address]] Deleter deleter;
 
@@ -263,8 +363,7 @@ struct ExternalControlBlock final : ControlBlockBase<M>
                          BlockPointer sourceAllocation,
                          Y *sourcePointer,
                          const Deleter &sourceDeleter)
-        : allocator(sourceAllocator)
-        , allocation(sourceAllocation)
+        : Base(sourceAllocator, sourceAllocation)
         , pointer(sourcePointer)
         , deleter(sourceDeleter)
     {}
@@ -273,14 +372,6 @@ struct ExternalControlBlock final : ControlBlockBase<M>
     {
         deleter(pointer);
         pointer = nullptr;
-    }
-
-    void destroySelf() noexcept override
-    {
-        BlockAllocator blockAllocator(allocator);
-        BlockPointer blockAllocation = allocation;
-        BlockTraits::destroy(blockAllocator, this);
-        BlockTraits::deallocate(blockAllocator, blockAllocation, 1);
     }
 
     void *getDeleter(const std::type_info &type) noexcept override
@@ -294,7 +385,9 @@ ExternalControlBlock<Y, M, Deleter, Allocator> *
 allocateExternalControlBlock(const Allocator &allocator, Y *pointer, const Deleter &deleter)
 {
     using Block = ExternalControlBlock<Y, M, Deleter, Allocator>;
-    return allocateControlBlock<Block>(allocator, pointer, deleter);
+    auto *cb = allocateControlBlock<Block>(allocator, pointer, deleter);
+    armSharedFromThis(cb, pointer);
+    return cb;
 }
 } // namespace detail
 
@@ -410,6 +503,15 @@ class SharedPtr
     template<typename Deleter, typename U, SharedMutex Mx>
     friend constexpr Deleter *getDeleter(const SharedPtr<U, Mx> &pointer) noexcept;
 
+    template<typename U, typename V, SharedMutex Mx>
+    friend constexpr SharedPtr<U, Mx> staticCast(const SharedPtr<V, Mx> &other) noexcept;
+
+    template<typename U, typename V, SharedMutex Mx>
+    friend constexpr SharedPtr<U, Mx> dynamicCast(const SharedPtr<V, Mx> &other) noexcept;
+
+    template<typename U, typename V, SharedMutex Mx>
+    friend constexpr SharedPtr<U, Mx> constCast(const SharedPtr<V, Mx> &other) noexcept;
+
     template<typename...>
     friend class ScopedLock;
 
@@ -420,8 +522,8 @@ private:
     T *m_data{nullptr};
 
     // Adopts an existing reference, it does not take one. Only the factories,
-    // WeakPtr::lock() and CopyOnWritePtr can hand out a control block.
-    SharedPtr(detail::ControlBlockBase<M> *cb, T *data) noexcept
+    // casts, WeakPtr::lock() and CopyOnWritePtr can hand out a control block.
+    constexpr SharedPtr(detail::ControlBlockBase<M> *cb, T *data) noexcept
         : m_cb(cb)
         , m_data(data)
     {}
@@ -487,7 +589,6 @@ public:
         m_cb = cb;
         m_data = static_cast<T *>(pointer);
         guard.active = false;
-        detail::armSharedFromThis(*this, pointer);
     }
 
     constexpr SharedPtr(const SharedPtr &other) noexcept
@@ -543,59 +644,19 @@ public:
         , m_data(static_cast<T *>(std::exchange(other.m_data, nullptr)))
     {}
 
-    // Used by safe::staticCast(), shares ownership with other
-    template<typename U>
-    constexpr SharedPtr(const SharedPtr<U, M> &other, detail::StaticCastTag) noexcept
-        : m_cb(other.m_cb)
-        , m_data(static_cast<T *>(other.m_data))
-    {
-        if (m_cb)
-            m_cb->addShared();
-    }
-
-    // Used by safe::constCast()
-    template<typename U>
-    constexpr SharedPtr(const SharedPtr<U, M> &other, detail::ConstCastTag) noexcept
-        : m_cb(other.m_cb)
-        , m_data(const_cast<T *>(other.m_data))
-    {
-        if (m_cb)
-            m_cb->addShared();
-    }
-
-    // Used by safe::dynamicCast(), empty if the cast fails
-    template<typename U>
-    constexpr SharedPtr(const SharedPtr<U, M> &other, detail::DynamicCastTag) noexcept
-        : m_data(dynamic_cast<T *>(other.m_data))
-    {
-        if (m_data) {
-            m_cb = other.m_cb;
-            if (m_cb)
-                m_cb->addShared();
-        }
-    }
-
     virtual constexpr ~SharedPtr() { release(); }
 
     constexpr SharedPtr &operator=(const SharedPtr &other) noexcept
     {
-        if (this != &other) {
-            release();
-            m_cb = other.m_cb;
-            m_data = other.m_data;
-            if (m_cb)
-                m_cb->addShared();
-        }
+        if (this != &other)
+            SharedPtr(other).swap(*this);
         return *this;
     }
 
     constexpr SharedPtr &operator=(SharedPtr &&other) noexcept
     {
-        if (this != &other) {
-            release();
-            m_cb = std::exchange(other.m_cb, nullptr);
-            m_data = std::exchange(other.m_data, nullptr);
-        }
+        if (this != &other)
+            SharedPtr(std::move(other)).swap(*this);
         return *this;
     }
 
@@ -603,11 +664,7 @@ public:
         requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
     constexpr SharedPtr &operator=(const SharedPtr<U, M> &other) noexcept
     {
-        release();
-        m_cb = other.m_cb;
-        m_data = static_cast<T *>(other.m_data);
-        if (m_cb)
-            m_cb->addShared();
+        SharedPtr(other).swap(*this);
         return *this;
     }
 
@@ -615,9 +672,7 @@ public:
         requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
     constexpr SharedPtr &operator=(SharedPtr<U, M> &&other) noexcept
     {
-        release();
-        m_cb = std::exchange(other.m_cb, nullptr);
-        m_data = static_cast<T *>(std::exchange(other.m_data, nullptr));
+        SharedPtr(std::move(other)).swap(*this);
         return *this;
     }
 
@@ -702,7 +757,7 @@ public:
         return UniqueLockGuard<T, M>(m_cb, m_data);
     }
 
-    virtual UniqueLockGuard<T, M> writeLock() const
+    UniqueLockGuard<T, M> writeLock() const
     {
         assert(m_data != nullptr && "SharedPtr is null!");
         return UniqueLockGuard<T, M>(m_cb, m_data);
@@ -719,21 +774,32 @@ public:
 template<typename T, typename U, SharedMutex M>
 [[nodiscard]] constexpr SharedPtr<T, M> staticCast(const SharedPtr<U, M> &other) noexcept
 {
-    return SharedPtr<T, M>(other, detail::StaticCastTag{});
+    if (!other.m_cb)
+        return {};
+    other.m_cb->addShared();
+    return SharedPtr<T, M>(other.m_cb, static_cast<T *>(other.m_data));
 }
 
 // std::dynamic_pointer_cast() equivalent, returns an empty pointer if the cast fails
 template<typename T, typename U, SharedMutex M>
 [[nodiscard]] constexpr SharedPtr<T, M> dynamicCast(const SharedPtr<U, M> &other) noexcept
 {
-    return SharedPtr<T, M>(other, detail::DynamicCastTag{});
+    if (auto *casted = dynamic_cast<T *>(other.m_data)) {
+        if (other.m_cb)
+            other.m_cb->addShared();
+        return SharedPtr<T, M>(other.m_cb, casted);
+    }
+    return {};
 }
 
 // std::const_pointer_cast() equivalent
 template<typename T, typename U, SharedMutex M>
 [[nodiscard]] constexpr SharedPtr<T, M> constCast(const SharedPtr<U, M> &other) noexcept
 {
-    return SharedPtr<T, M>(other, detail::ConstCastTag{});
+    if (!other.m_cb)
+        return {};
+    other.m_cb->addShared();
+    return SharedPtr<T, M>(other.m_cb, const_cast<T *>(other.m_data));
 }
 
 template<typename Deleter, typename T, SharedMutex M>
@@ -762,9 +828,20 @@ class WeakPtr
     template<typename, SharedMutex>
     friend class WeakPtr;
 
+    template<typename Object, SharedMutex Mx>
+    friend void detail::armSharedFromThis(detail::ControlBlockBase<Mx> *, Object *) noexcept;
+
 private:
     detail::ControlBlockBase<M> *m_cb{nullptr};
     T *m_data{nullptr};
+
+    constexpr WeakPtr(detail::ControlBlockBase<M> *cb, T *data) noexcept
+        : m_cb(cb)
+        , m_data(data)
+    {
+        if (m_cb)
+            m_cb->addWeak();
+    }
 
     constexpr void release() noexcept
     {
@@ -819,23 +896,15 @@ public:
 
     constexpr WeakPtr &operator=(const WeakPtr &other) noexcept
     {
-        if (this != &other) {
-            release();
-            m_cb = other.m_cb;
-            m_data = other.m_data;
-            if (m_cb)
-                m_cb->addWeak();
-        }
+        if (this != &other)
+            WeakPtr(other).swap(*this);
         return *this;
     }
 
     constexpr WeakPtr &operator=(WeakPtr &&other) noexcept
     {
-        if (this != &other) {
-            release();
-            m_cb = std::exchange(other.m_cb, nullptr);
-            m_data = std::exchange(other.m_data, nullptr);
-        }
+        if (this != &other)
+            WeakPtr(std::move(other)).swap(*this);
         return *this;
     }
 
@@ -843,11 +912,7 @@ public:
         requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
     constexpr WeakPtr &operator=(const WeakPtr<U, M> &other) noexcept
     {
-        release();
-        m_cb = other.m_cb;
-        m_data = static_cast<T *>(other.m_data);
-        if (m_cb)
-            m_cb->addWeak();
+        WeakPtr(other).swap(*this);
         return *this;
     }
 
@@ -855,11 +920,7 @@ public:
         requires std::is_convertible_v<U *, T *>
     constexpr WeakPtr &operator=(const SharedPtr<U, M> &shared) noexcept
     {
-        release();
-        m_cb = shared.m_cb;
-        m_data = static_cast<T *>(shared.m_data);
-        if (m_cb)
-            m_cb->addWeak();
+        WeakPtr(shared).swap(*this);
         return *this;
     }
 
@@ -999,8 +1060,8 @@ template<typename... Ptrs>
 template<typename T, SharedMutex M>
 class EnableSharedFromThis
 {
-    template<typename Owner, typename Object, SharedMutex Mx>
-    friend void detail::armSharedFromThis(const SharedPtr<Owner, Mx> &, Object *) noexcept;
+    template<typename Object, SharedMutex Mx>
+    friend void detail::armSharedFromThis(detail::ControlBlockBase<Mx> *, Object *) noexcept;
 
     WeakPtr<T, M> m_weakThis;
 
@@ -1033,8 +1094,8 @@ public:
 };
 
 namespace detail {
-template<typename Owner, typename Object, SharedMutex M>
-void armSharedFromThis(const SharedPtr<Owner, M> &owner, Object *object) noexcept
+template<typename Object, SharedMutex M>
+void armSharedFromThis(ControlBlockBase<M> *cb, Object *object) noexcept
 {
     if constexpr (!std::is_const_v<Object> && HasSharedFromThis<Object, M>) {
         // EnableSharedFromThis<U, M>, with U deduced from the base rather than
@@ -1042,10 +1103,8 @@ void armSharedFromThis(const SharedPtr<Owner, M> &owner, Object *object) noexcep
         using EsftBase = std::remove_pointer_t<decltype(esftBaseOf<M>(object))>;
         using SharedType = typename EsftBase::ElementType;
         auto *base = static_cast<EsftBase *>(object);
-        if (base->m_weakThis.expired()) {
-            SharedPtr<SharedType, M> self(owner, static_cast<SharedType *>(object));
-            base->m_weakThis = self;
-        }
+        if (base->m_weakThis.expired())
+            base->m_weakThis = WeakPtr<SharedType, M>(cb, static_cast<SharedType *>(object));
     }
 }
 } // namespace detail
@@ -1061,14 +1120,21 @@ SharedPtr<T, M> allocateShared(const Allocator &allocator, Args &&...args)
 {
     auto *cb =
         detail::allocateInplaceControlBlock<T, M>(allocator, std::forward<Args>(args)...);
-    T *data = cb->data.get();
-    SharedPtr<T, M> pointer(cb, data);
-    detail::armSharedFromThis(pointer, data);
-    return pointer;
+    return SharedPtr<T, M>(cb, cb->data.get());
 }
 
 // A shared pointer that clones the object the first time it is written to while
 // other owners exist.
+//
+// What gets cloned:
+//  - An object created by makeCopyOnWrite() / allocateCopyOnWrite() is cloned as
+//    its complete type and with its allocator, no matter which base class the
+//    detaching pointer looks at it through.
+//  - An object adopted from a plain SharedPtr<U> is cloned as U, the static type
+//    of that pointer, into a std::allocator block: the deleter and allocator it
+//    was created with say nothing about how to make a second one. Adopt it
+//    through a SharedPtr to the complete type, or it is sliced to U. U has to be
+//    copy constructible, which is checked when the pointer is adopted.
 //
 // Interaction with WeakPtr: a WeakPtr observes a *control block*, not a pointer.
 // Once this pointer detaches it moves to a fresh block, so observers taken before
@@ -1079,51 +1145,146 @@ template<typename T, SharedMutex M>
 class CopyOnWritePtr : public SharedPtr<T, M>
 {
     using Base = SharedPtr<T, M>;
+    using CloneFunction = detail::CloneResult<M> (*)(const void *, const void *);
 
-    template<typename U, SharedMutex Mx, typename... Args>
-    friend CopyOnWritePtr<U, Mx> makeCopyOnWrite(Args &&...args);
+    template<typename, SharedMutex>
+    friend class CopyOnWritePtr;
+
+    template<typename U, SharedMutex Mx, typename Allocator, typename... Args>
+        requires std::copy_constructible<U>
+    friend CopyOnWritePtr<U, Mx> allocateCopyOnWrite(const Allocator &allocator, Args &&...args);
+
+    // How to clone an object adopted from a plain SharedPtr, whose block cannot
+    // do it. Captured where the static type is still known and carried along by
+    // the conversions to a base class. It describes the object of m_cloneOwner
+    // only, which is compared before use: the pointer can still be re-seated
+    // behind our back through a SharedPtr reference.
+    CloneFunction m_clone{nullptr};
+    const void *m_cloneRoot{nullptr};
+    const void *m_cloneOwner{nullptr};
 
     CopyOnWritePtr(detail::ControlBlockBase<M> *cb, T *data) noexcept
         : Base(cb, data)
     {}
 
-    // Note: T is what gets cloned, so holding a base pointer to a derived object
-    // (e.g. after an up-cast) slices the object on the first detach().
+    template<typename U>
+    constexpr CopyOnWritePtr(const U *root, SharedPtr<U, M> &&other) noexcept
+        : Base(std::move(other))
+    {
+        captureClone(root);
+    }
+
+    template<typename U>
+    constexpr void captureClone(const U *root) noexcept
+    {
+        if (root) {
+            m_clone = &detail::cloneStatic<std::remove_cv_t<U>, M>;
+            m_cloneRoot = root;
+            m_cloneOwner = this->m_cb;
+        }
+    }
+
     void detach()
     {
-        if (!this->m_cb)
+        if (!this->m_cb || this->m_cb->sharedRefs.load(std::memory_order_acquire) <= 1)
             return;
 
-        if (this->m_cb->sharedRefs.load(std::memory_order_acquire) > 1) {
-            detail::InplaceControlBlock<T, M, std::allocator<std::byte>> *newCb = nullptr;
-            {
-                // Read-Lock old data to protect copy constructor execution. The guard
-                // must be released before release(), which may destroy the old block
-                // (and with it the mutex) if the other owners vanish meanwhile.
-                auto oldDataGuard = this->readLock();
-
-                // Create cloned block
-                newCb = detail::allocateInplaceControlBlock<T, M>(
-                    std::allocator<std::byte>{}, *oldDataGuard);
-            }
-
-            this->release();
-
-            this->m_cb = newCb;
-            this->m_data = newCb->data.get();
-            detail::armSharedFromThis(static_cast<const Base &>(*this), this->m_data);
+        detail::CloneResult<M> cloned;
+        {
+            // Read-Lock old data to protect copy constructor execution. The lock
+            // must be released before release(), which may destroy the old block
+            // (and with it the mutex) if the other owners vanish meanwhile.
+            std::shared_lock lock(this->m_cb->mutex);
+            cloned = this->m_cb->clone(this->m_data);
+            if (!cloned.cb && m_clone && m_cloneOwner == this->m_cb)
+                cloned = m_clone(m_cloneRoot, this->m_data);
         }
+
+        // Only reachable if the pointer was re-seated through a SharedPtr
+        // reference, which bypasses everything a CopyOnWritePtr keeps track of.
+        // Writing to the shared object instead would silently break every other
+        // owner, so refuse.
+        if (!cloned.cb)
+            throw std::logic_error("safe::CopyOnWritePtr cannot clone the object it shares");
+
+        this->release();
+        this->m_cb = cloned.cb;
+        this->m_data = static_cast<T *>(cloned.data);
+
+        // The new block clones itself
+        m_clone = nullptr;
+        m_cloneRoot = nullptr;
+        m_cloneOwner = nullptr;
     }
 
 public:
     constexpr CopyOnWritePtr() = default;
 
-    // Adopts a shared object. Deliberately not `using Base::Base`: inheriting the
-    // converting constructors would let SharedPtr<Derived> become CopyOnWritePtr<Base>
-    // implicitly, which slices on the first detach().
-    constexpr CopyOnWritePtr(const Base &other) noexcept
-        : Base(other)
+    constexpr CopyOnWritePtr(std::nullptr_t) noexcept
+        : Base(nullptr)
     {}
+
+    constexpr CopyOnWritePtr(const CopyOnWritePtr &) noexcept = default;
+    constexpr CopyOnWritePtr(CopyOnWritePtr &&) noexcept = default;
+
+    // Up-casts keep the knowledge of how to clone the complete object
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    constexpr CopyOnWritePtr(const CopyOnWritePtr<U, M> &other) noexcept
+        : Base(static_cast<const SharedPtr<U, M> &>(other))
+        , m_clone(other.m_clone)
+        , m_cloneRoot(other.m_cloneRoot)
+        , m_cloneOwner(other.m_cloneOwner)
+    {}
+
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    constexpr CopyOnWritePtr(CopyOnWritePtr<U, M> &&other) noexcept
+        : Base(static_cast<SharedPtr<U, M> &&>(other))
+        , m_clone(other.m_clone)
+        , m_cloneRoot(other.m_cloneRoot)
+        , m_cloneOwner(other.m_cloneOwner)
+    {}
+
+    // Adopts a shared object. A detach clones it as U, see the class comment.
+    template<typename U>
+        requires(std::is_convertible_v<U *, T *> && std::copy_constructible<std::remove_cv_t<U>>)
+    constexpr CopyOnWritePtr(const SharedPtr<U, M> &other) noexcept
+        : Base(other)
+    {
+        captureClone(other.m_data);
+    }
+
+    template<typename U>
+        requires(std::is_convertible_v<U *, T *> && std::copy_constructible<std::remove_cv_t<U>>)
+    constexpr CopyOnWritePtr(SharedPtr<U, M> &&other) noexcept
+        : CopyOnWritePtr(static_cast<const U *>(other.m_data), std::move(other))
+    {}
+
+    constexpr CopyOnWritePtr &operator=(const CopyOnWritePtr &) noexcept = default;
+    constexpr CopyOnWritePtr &operator=(CopyOnWritePtr &&) noexcept = default;
+
+    // Everything a CopyOnWritePtr can be constructed from can be assigned too
+    template<typename Other>
+        requires(!std::is_same_v<std::remove_cvref_t<Other>, CopyOnWritePtr>
+                 && std::is_convertible_v<Other, CopyOnWritePtr>)
+    constexpr CopyOnWritePtr &operator=(Other &&other) noexcept
+    {
+        CopyOnWritePtr(std::forward<Other>(other)).swap(*this);
+        return *this;
+    }
+
+    // Hides the SharedPtr overloads that adopt a raw pointer: the block they
+    // create cannot be cloned
+    constexpr void reset() noexcept { Base::reset(); }
+
+    constexpr void swap(CopyOnWritePtr &other) noexcept
+    {
+        Base::swap(other);
+        std::swap(m_clone, other.m_clone);
+        std::swap(m_cloneRoot, other.m_cloneRoot);
+        std::swap(m_cloneOwner, other.m_cloneOwner);
+    }
 
     UniqueLockGuard<T, M> writeLock() override
     {
@@ -1134,14 +1295,19 @@ public:
 };
 
 template<typename T, SharedMutex M, typename... Args>
+    requires std::copy_constructible<T>
 CopyOnWritePtr<T, M> makeCopyOnWrite(Args &&...args)
 {
-    auto *cb = detail::allocateInplaceControlBlock<T, M>(
-        std::allocator<std::byte>{}, std::forward<Args>(args)...);
-    T *data = cb->data.get();
-    CopyOnWritePtr<T, M> pointer(cb, data);
-    detail::armSharedFromThis(static_cast<const SharedPtr<T, M> &>(pointer), data);
-    return pointer;
+    return allocateCopyOnWrite<T, M>(std::allocator<std::byte>{}, std::forward<Args>(args)...);
+}
+
+template<typename T, SharedMutex M, typename Allocator, typename... Args>
+    requires std::copy_constructible<T>
+CopyOnWritePtr<T, M> allocateCopyOnWrite(const Allocator &allocator, Args &&...args)
+{
+    auto *cb =
+        detail::allocateCloneableControlBlock<T, M>(allocator, std::forward<Args>(args)...);
+    return CopyOnWritePtr<T, M>(cb, cb->data.get());
 }
 
 } // namespace safe

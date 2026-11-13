@@ -160,6 +160,14 @@ private:
     std::shared_mutex m_mutex;
 };
 
+// Only ever declared in the tests, the definition lives in OpaqueHandle.cpp. This
+// is the C handle / pimpl situation: the pointer has to own a type it cannot see.
+struct Opaque;
+Opaque *createOpaque(int value);
+void destroyOpaque(Opaque *opaque) noexcept;
+int opaqueValue(const Opaque *opaque) noexcept;
+int opaqueAlive() noexcept;
+
 template<typename P>
 size_t sharedCount(const P &pointer)
 {

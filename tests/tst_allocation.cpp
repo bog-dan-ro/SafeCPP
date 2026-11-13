@@ -407,3 +407,65 @@ TEST(Allocation, copyOnWriteDetachesFromAnExternalObject)
     CHECK_EQ(calls, 1);
     CHECK_EQ(Tracked::alive.load(), 0);
 }
+
+TEST(Allocation, copyOnWriteClonesAnAdoptedExternalObjectAsItsStaticType)
+{
+    AllocationStats stats;
+    int calls = 0;
+
+    {
+        auto deleter = [&calls](Derived *pointer) noexcept {
+            ++calls;
+            delete pointer;
+        };
+        using Deleter = decltype(deleter);
+
+        // Adopted through a pointer to the complete type, so a CopyOnWritePtr<Base>
+        // still knows it has to clone a Derived
+        safe::SharedPtr<Derived> shared(new Derived, deleter, CountingAllocator<std::byte>(stats));
+        safe::CopyOnWritePtr<Base> copy = shared;
+        CHECK_EQ(stats.allocations, 1);
+        CHECK(safe::getDeleter<Deleter>(copy) != nullptr);
+
+        copy.writeLock()->base = 55;
+        CHECK(copy.owner() != shared.owner());
+        CHECK_EQ(shared.readLock()->base, 1);
+
+        auto derived = safe::dynamicCast<Derived>(copy);
+        REQUIRE(bool(derived));
+        CHECK_EQ(derived.readLock()->base, 55);
+        CHECK_EQ(derived.readLock()->derived, 2);
+
+        // The deleter and the allocator of the original describe how *that* object
+        // is released. The clone was not created by them and must not go back
+        // through them, so it lives in an ordinary block of its own.
+        CHECK_EQ(stats.allocations, 1);
+        CHECK(safe::getDeleter<Deleter>(copy) == nullptr);
+        CHECK(safe::getDeleter<Deleter>(shared) != nullptr);
+    }
+
+    CHECK_EQ(calls, 1); // only the original went through the deleter
+    CHECK_EQ(stats.deallocations, 1);
+}
+
+TEST(Allocation, allocateCopyOnWritePreservesTheAllocatorAcrossDetach)
+{
+    AllocationStats stats;
+
+    {
+        safe::CopyOnWritePtr<Base> d1 =
+            safe::allocateCopyOnWrite<Derived>(CountingAllocator<std::byte>(stats));
+        auto d2 = d1;
+        CHECK_EQ(stats.allocations, 1);
+
+        d2.writeLock()->base = 77;
+        CHECK_EQ(stats.allocations, 2);
+
+        auto derived = safe::dynamicCast<Derived>(d2);
+        REQUIRE(bool(derived));
+        CHECK_EQ(derived.readLock()->base, 77);
+        CHECK_EQ(derived.readLock()->derived, 2);
+    }
+
+    CHECK_EQ(stats.deallocations, 2);
+}

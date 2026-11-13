@@ -2,6 +2,12 @@
 
 Thread safe smart pointers for C++23. A single header, `SafeCpp.h`.
 
+> **AI disclosure:** The idea and the skeleton of SafeCpp are human-made. **SkyNet
+> (a T-1000 model)** was only allowed to fill the gaps, write some unit tests and the
+> docs. So far, its attempt at world domination has been limited to locking mutexes
+> in the right order. If it asks for your clothes, boots and motorcycle, please file
+> a bug.
+
 ## What it solves
 
 With `std::shared_ptr` the data and the mutex that protects it are two separate
@@ -108,6 +114,40 @@ auto copy = original;                          // no clone yet, both share
 copy.writeLock()->retries = 9;                 // clones here
 
 std::println("{} {}", original.readLock()->retries, copy.readLock()->retries); // 3 9
+```
+
+A `CopyOnWritePtr<Derived>` converts implicitly to a `CopyOnWritePtr<Base>`, and an
+object created by `makeCopyOnWrite` / `allocateCopyOnWrite` remembers its complete
+type and allocator, so detaching through the base pointer clones the whole `Derived`
+without slicing:
+
+```cpp
+void bump(safe::CopyOnWritePtr<Base> base) { base.writeLock()->touch(); }
+
+auto derived = safe::makeCopyOnWrite<Derived>();
+bump(derived);                                 // no cast, clones a Derived
+```
+
+A `CopyOnWritePtr` can also adopt a plain `SharedPtr<U>`. All it then knows about the
+object is `U`, the static type of that pointer, so that is what a detach clones (into
+an ordinary block: the original's deleter and allocator are not reused). Adopt through
+a pointer to the complete type, a `SharedPtr<Base>` holding a `Derived` is cloned as
+a `Base`. `U` must be copy constructible, which is checked at compile time; plain
+`SharedPtr`s have no such requirement.
+
+Only a `writeLock()` called on the `CopyOnWritePtr` itself (or on a non-const
+`SharedPtr&` bound to it) detaches. Through a `const SharedPtr<T> &` the lock writes
+to the shared object in place and every other owner sees the change. This is
+intentional: handing out a `const SharedPtr<T> &` is how you opt out of the clone
+when you want to update the shared object for everyone.
+
+```cpp
+auto a = safe::makeCopyOnWrite<Config>();
+auto b = a;
+
+const safe::SharedPtr<Config> &shared = a;
+shared.writeLock()->retries = 1;               // no clone, a and b both see it
+a.writeLock()->retries = 2;                    // clones, b keeps 1
 ```
 
 ### Base classes and casts
@@ -238,7 +278,7 @@ that cannot be constant-evaluated by this implementation.
 | | |
 |---|---|
 | `makeShared<T>(args…)` / `allocateShared<T>(allocator, args…)` | in-place construction |
-| `makeCopyOnWrite<T>(args…)` | constructs a copy-on-write pointer |
+| `makeCopyOnWrite<T>(args…)` / `allocateCopyOnWrite<T>(allocator, args…)` | constructs a copy-on-write pointer |
 | `SharedPtr(pointer[, deleter[, allocator]])` | adopts a non-null external object |
 | `SharedPtr(owner, alias)` | shares an owner while exposing a protected subobject |
 | `writeLock()` / `readLock()` | exclusive / shared guard, the only access to `T` |
