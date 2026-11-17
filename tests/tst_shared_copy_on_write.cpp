@@ -172,6 +172,23 @@ static_assert(std::is_assignable_v<safe::WeakPtr<Base> &,
                                    const safe::SharedCopyOnWritePtr<Derived> &>);
 static_assert(std::is_convertible_v<const safe::CopyOnWritePtr<Derived> &, safe::WeakPtr<Base>>);
 
+// ... and an observer of the slot like from a SharedCopyOnWritePtr, which it locks
+// back into
+static_assert(std::is_convertible_v<const safe::SharedCopyOnWritePtr<Derived> &,
+                                    safe::WeakCopyOnWritePtr<Base>>);
+static_assert(!std::is_convertible_v<const safe::SharedCopyOnWritePtr<Base> &,
+                                     safe::WeakCopyOnWritePtr<Derived>>);
+static_assert(
+    std::is_convertible_v<const safe::CopyOnWritePtr<Derived> &, safe::WeakCopyOnWritePtr<Base>>);
+static_assert(std::is_convertible_v<const safe::WeakCopyOnWritePtr<Derived> &,
+                                    safe::WeakCopyOnWritePtr<Base>>);
+static_assert(!std::is_convertible_v<const safe::WeakCopyOnWritePtr<Base> &,
+                                     safe::WeakCopyOnWritePtr<Derived>>);
+static_assert(
+    std::is_same_v<decltype(std::declval<const safe::WeakCopyOnWritePtr<Base> &>().lock()),
+                   safe::SharedCopyOnWritePtr<Base>>);
+static_assert(!CanWriteLock<safe::WeakCopyOnWritePtr<Tracked> &>);
+
 // A cast returns the kind of pointer it was given...
 static_assert(std::is_same_v<decltype(safe::staticCast<Derived>(
                                  std::declval<const safe::SharedCopyOnWritePtr<Base> &>())),
@@ -311,6 +328,24 @@ constexpr bool emptyCopyOnWriteApi()
 
 static_assert(emptySharedCopyOnWriteApi());
 static_assert(emptyCopyOnWriteApi());
+
+constexpr bool emptyWeakCopyOnWriteApi()
+{
+    safe::SharedCopyOnWritePtr<ConstexprDerived> nothing;
+    safe::WeakCopyOnWritePtr<ConstexprDerived> first = nothing;
+    safe::WeakCopyOnWritePtr<ConstexprDerived> copy(first);
+    safe::WeakCopyOnWritePtr<ConstexprBase> base = copy;
+    safe::WeakCopyOnWritePtr<ConstexprDerived> moved(std::move(copy));
+    first = moved;
+    first = nothing;
+    first.reset();
+    swap(first, moved);
+
+    return first.expired() && !first.lock() && first.owner() == nullptr && first.useCount() == 0
+           && first == moved && (first <=> base) == std::strong_ordering::equal && base.expired();
+}
+
+static_assert(emptyWeakCopyOnWriteApi());
 
 // A slot of its own that shares the object of source, the way a copy of source
 // would. Made from source itself the pointer would share the slot of source.
@@ -1527,6 +1562,140 @@ TEST(SharedCopyOnWrite, aWeakPointerFollowsTheObjectNotTheSlot)
     before.reset();
     CHECK(observer.expired());
     CHECK_EQ(pointer.readLock()->right, 22);
+}
+
+TEST(SharedCopyOnWrite, aWeakCopyOnWritePointerLocksBackIntoTheSlot)
+{
+    Tracked::resetCounters();
+    std::vector<safe::CopyOnWritePtr<Tracked>> original{safe::makeCopyOnWrite<Tracked>(1)};
+    auto working = original;
+
+    safe::WeakCopyOnWritePtr<Tracked> observer = working[0];
+    CHECK(!observer.expired());
+    CHECK_EQ(observer.useCount(), std::size_t(1)); // working[0] alone
+
+    {
+        auto item = observer.lock();
+        REQUIRE(bool(item));
+        CHECK(item.owner() == observer.owner());
+        item.writeLock()->value = 2; // clones, working[0] follows
+    }
+    CHECK_EQ(Tracked::copied.load(), 1);
+    CHECK_EQ(working[0].readLock()->value, 2);
+    CHECK_EQ(original[0].readLock()->value, 1);
+
+    // Unlike a WeakPtr it follows the slot to the clone
+    auto again = observer.lock();
+    CHECK(again == working[0]);
+    again.writeLock()->value = 3; // in place, nothing left to clone
+    CHECK_EQ(Tracked::copied.load(), 1);
+    CHECK_EQ(working[0].readLock()->value, 3);
+    CHECK_EQ(observer.useCount(), std::size_t(2)); // working[0] and again
+
+    // A growing vector moves the element, and the slot with it
+    working.reserve(working.capacity() * 2 + 1);
+    observer.lock().writeLock()->value = 4;
+    CHECK_EQ(working[0].readLock()->value, 4);
+}
+
+TEST(SharedCopyOnWrite, aWeakCopyOnWritePointerDoesNotKeepTheObjectAlive)
+{
+    Tracked::resetCounters();
+    safe::WeakCopyOnWritePtr<Tracked> observer;
+    {
+        auto pointer = safe::makeSharedCopyOnWrite<Tracked>(1);
+        observer = pointer;
+        auto copy = observer;
+        CHECK(copy == observer);
+        CHECK_EQ(Tracked::alive.load(), 1);
+    }
+    CHECK_EQ(Tracked::alive.load(), 0);
+    CHECK(observer.expired());
+    CHECK(!observer.lock());
+    CHECK(observer.owner() != nullptr); // still names the slot it watched
+}
+
+TEST(SharedCopyOnWrite, aWeakCopyOnWritePointerExpiresWithTheLastPointerOfItsSlot)
+{
+    auto source = safe::makeCopyOnWrite<Tracked>(1);
+    auto element = source;
+    safe::WeakCopyOnWritePtr<Tracked> observer = element;
+    auto handle = observer.lock();
+
+    handle.reset();
+    CHECK(!observer.expired()); // element still has the slot
+
+    // Assigned to, element is another pointer and the slot has lost its last one
+    element = source;
+    CHECK(observer.expired());
+    CHECK(!observer.lock());
+    CHECK_EQ(element.readLock()->value, 1);
+}
+
+TEST(SharedCopyOnWrite, aLockGuardOutlivesTheLastPointerOfAWatchedSlot)
+{
+    Tracked::resetCounters();
+    auto pointer = safe::makeSharedCopyOnWrite<Tracked>(1);
+    safe::WeakCopyOnWritePtr<Tracked> observer = pointer;
+    {
+        auto guard = pointer.writeLock();
+        pointer.reset();
+        CHECK(observer.expired()); // a guard is not a pointer
+        guard->value = 2;          // but stays valid
+        CHECK_EQ(Tracked::alive.load(), 1);
+    }
+    CHECK_EQ(Tracked::alive.load(), 0);
+    CHECK(!observer.lock());
+}
+
+TEST(SharedCopyOnWrite, weakCopyOnWritePointersConvertToABaseOfTheSameSlot)
+{
+    auto pointer = safe::makeSharedCopyOnWrite<Both>();
+    safe::WeakCopyOnWritePtr<Both> observer = pointer;
+    safe::WeakCopyOnWritePtr<Right> right = observer;
+    safe::WeakCopyOnWritePtr<Right> fromPointer = pointer;
+    CHECK(right == observer);
+    CHECK(fromPointer == right);
+
+    right.lock().writeLock()->right = 21;
+    CHECK_EQ(pointer.readLock()->right, 21);
+    CHECK_EQ(fromPointer.lock().readLock()->right, 21);
+
+    // From the CopyOnWritePtr a slot belongs to, through a base class
+    auto source = safe::makeCopyOnWrite<Both>();
+    auto element = source;
+    safe::WeakCopyOnWritePtr<Right> elementRight = element;
+    elementRight.lock().writeLock()->right = 22;
+    CHECK_EQ(element.readLock()->right, 22);
+    CHECK_EQ(source.readLock()->right, 20);
+
+    // Where a base class is can only be asked of a live object
+    pointer.reset();
+    safe::WeakCopyOnWritePtr<Right> late = observer;
+    CHECK(observer.expired());
+    CHECK(late.owner() == nullptr);
+}
+
+TEST(SharedCopyOnWrite, weakCopyOnWritePointersCompareByTheirSlot)
+{
+    auto first = safe::makeSharedCopyOnWrite<Tracked>(1);
+    auto second = safe::makeSharedCopyOnWrite<Tracked>(2);
+    safe::WeakCopyOnWritePtr<Tracked> a = first;
+    safe::WeakCopyOnWritePtr<Tracked> b = second;
+    CHECK(a != b);
+    CHECK((a <=> b) != std::strong_ordering::equal);
+    CHECK(a.owner() == first.owner());
+
+    swap(a, b);
+    CHECK(a.owner() == second.owner());
+    b = std::move(a);
+    CHECK(b.owner() == second.owner());
+    CHECK(a.owner() == nullptr);
+    a = b;
+    CHECK(a == b);
+    b.reset();
+    CHECK(b.expired());
+    CHECK(!a.expired());
 }
 
 TEST(SharedCopyOnWrite, convertsExplicitlyToAnIndependentCopyOnWritePointer)

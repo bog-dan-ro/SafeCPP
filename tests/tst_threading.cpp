@@ -173,6 +173,41 @@ TEST(Threading, weakLockRacesWithTheLastRelease)
     std::println("    (weak lock won {} of {} races)", locked.load(), rounds);
 }
 
+TEST(Threading, weakCopyOnWriteLockRacesWithTheLastRelease)
+{
+    Tracked::resetCounters();
+    std::atomic<int> locked{0};
+    std::atomic<int> expired{0};
+
+    for (int round = 0; round < rounds; ++round) {
+        auto pointer = safe::makeSharedCopyOnWrite<Tracked>(round);
+        std::optional<safe::WeakCopyOnWritePtr<Tracked>> observer{std::in_place, pointer};
+
+        // The locker drops the only observer too, so the slot's last reference
+        // can go on either thread
+        SpinGate gate;
+        std::jthread releaser([&pointer, &gate] {
+            gate.wait();
+            pointer.reset();
+        });
+        std::jthread locker([&observer, &gate, &locked, &expired, round] {
+            gate.wait();
+            if (auto item = observer->lock()) {
+                ++locked;
+                CHECK_EQ(item.readLock()->value, round);
+            } else {
+                ++expired;
+            }
+            observer.reset();
+        });
+        gate.releaseWhenReady(2);
+    }
+
+    CHECK_EQ(Tracked::alive.load(), 0);
+    CHECK_EQ(locked.load() + expired.load(), rounds);
+    std::println("    (weak copy-on-write lock won {} of {} races)", locked.load(), rounds);
+}
+
 TEST(Threading, copyOnWriteDetachesSafelyWhenBothOwnersWriteAtOnce)
 {
     Tracked::resetCounters();

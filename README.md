@@ -230,6 +230,17 @@ knows the object they currently have. A copy of `working[3]` is still an indepen
   slot holds that pointer's object right now. `useCount()` counts the pointers on the
   slot, `weakCount()` the observers of the current object; a `WeakPtr` made from the
   pointer watches that object, not the slot.
+- **Watching the slot.** A `WeakCopyOnWritePtr` made from a `SharedCopyOnWritePtr`, or
+  from the `CopyOnWritePtr` itself, watches the slot without keeping its object alive.
+  Its `lock()` gives back a `SharedCopyOnWritePtr` as long as any pointer of the slot
+  is left, the `CopyOnWritePtr` included, and it follows the slot to every clone:
+
+  ```cpp
+  safe::WeakCopyOnWritePtr<Item> observer = working[3];
+
+  if (auto item = observer.lock())             // a SharedCopyOnWritePtr, or empty
+      item.writeLock()->name = "z";            // reaches working[3]
+  ```
 - **It is not a `SharedPtr`:** no implicit conversion to one, and no `lockAll`.
 
 Made from a temporary `CopyOnWritePtr`, or by `makeSharedCopyOnWrite` /
@@ -420,11 +431,12 @@ that cannot be constant-evaluated by this implementation.
 | `writeLock()` / `readLock()` | exclusive / shared guard, the only access to `T` |
 | `lockAll(a, b, …)` | deadlock free multi lock, `get<I>()` per object |
 | `WeakPtr::lock()` / `expired()` | promote to an owner / cheap check |
+| `WeakCopyOnWritePtr::lock()` | watches a slot, gives back a `SharedCopyOnWritePtr` |
 | `staticCast` / `dynamicCast` / `constCast` | share the control block, or the slot; not for `CopyOnWritePtr` |
 | `getDeleter<D>(pointer)` | query an externally supplied deleter |
 | `useCount()` / `weakCount()` / `owner()` | owners, observers, identity |
 | `reset()` / `swap()` / `==` / `<=>` | ownership comparison, ordered container friendly |
-| `std::hash<SharedPtr/WeakPtr/SharedCopyOnWritePtr>` | hashes the owner, unordered container friendly |
+| `std::hash<SharedPtr/WeakPtr/SharedCopyOnWritePtr/WeakCopyOnWritePtr>` | hashes the owner, unordered container friendly |
 | `EnableSharedFromThis<T>` | `sharedFromThis()`, `weakFromThis()` |
 | `SharedSpinLock` / `SpinLock` | spin locks; the shared one can be a pointer's mutex |
 | `SAFECPP_THROW_ON_NULL` / `BadPointerAccess` | a null pointer throws instead of asserting |

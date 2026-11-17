@@ -266,6 +266,9 @@ template<typename T, SharedMutex M = std::shared_mutex>
 class SharedCopyOnWritePtr;
 
 template<typename T, SharedMutex M = std::shared_mutex>
+class WeakCopyOnWritePtr;
+
+template<typename T, SharedMutex M = std::shared_mutex>
 class EnableSharedFromThis;
 
 template<typename T, SharedMutex M = std::shared_mutex, typename... Args>
@@ -672,6 +675,10 @@ struct CopyOnWriteSlot
 
     // The pointers sharing the slot, the CopyOnWritePtr it belongs to included
     std::atomic<std::size_t> refs{1};
+    // The WeakCopyOnWritePtrs watching the slot, plus one held collectively by the
+    // pointers and the pins. The object goes with the last of those, the slot
+    // itself with the last observer.
+    std::atomic<std::size_t> weakRefs{1};
 
     // Held by the one writer that clones the object, so writers racing for the
     // first write do not each make a clone. Never taken on any other path.
@@ -679,7 +686,7 @@ struct CopyOnWriteSlot
 
     // Guards everything below
     SpinLock spin;
-    bool orphaned{false}; // the last pointer is gone, the last pin destroys the slot
+    bool orphaned{false}; // the last pointer is gone, the last pin retires the slot
     ControlBlockBase<M> *cb; // never null, the slot owns one reference
     void *data;
     std::size_t pins{0}; // references to cb handed out by pin()
@@ -713,6 +720,22 @@ struct CopyOnWriteSlot
 
     void addRef() noexcept { refs.fetch_add(1, std::memory_order_relaxed); }
 
+    // One more pointer for WeakCopyOnWritePtr::lock(), unless the last one is gone
+    // already: a slot that lost its last pointer never gets one again
+    bool tryAddRef() noexcept
+    {
+        std::size_t count = refs.load(std::memory_order_relaxed);
+        while (count != 0) {
+            if (refs.compare_exchange_weak(count,
+                                           count + 1,
+                                           std::memory_order_acquire,
+                                           std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void release() noexcept
     {
         if (refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
@@ -726,13 +749,23 @@ struct CopyOnWriteSlot
             last = livePins == 0;
         }
         if (last)
-            destroy();
+            retire();
     }
 
-    void destroy() noexcept
+    // The last pointer and the last pin are gone: the object goes, the slot stays
+    // for the observers that still watch it
+    void retire() noexcept
     {
         cb->releaseShared();
-        destroySelf();
+        releaseWeak();
+    }
+
+    void addWeak() noexcept { weakRefs.fetch_add(1, std::memory_order_relaxed); }
+
+    void releaseWeak() noexcept
+    {
+        if (weakRefs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            destroySelf();
     }
 
     Pinned pin() noexcept
@@ -762,13 +795,13 @@ struct CopyOnWriteSlot
             --livePins;
             last = orphaned && livePins == 0;
         }
-        // Unless it is ours to destroy, the slot may be gone from here on
+        // Unless it is ours to retire, the slot may be gone from here on
 
         // The slot had moved on, this was a plain reference to an earlier block
         if (!current)
             block->releaseShared();
         if (last)
-            destroy();
+            retire();
     }
 
     // A reference to the current block for a pointer that goes its own way. Not a
@@ -2358,7 +2391,8 @@ CopyOnWritePtr<T, M> allocateCopyOnWrite(const Allocator &allocator, Args &&...a
 //  - The casts stay on the slot: they return a SharedCopyOnWritePtr to another
 //    type of the same object, and a write through it clones like any other.
 //  - A WeakPtr made from the pointer, weakCount() and == against a SharedPtr or
-//    a CopyOnWritePtr are about the object the slot holds at that moment.
+//    a CopyOnWritePtr are about the object the slot holds at that moment. A
+//    WeakCopyOnWritePtr watches the slot instead and locks back into one of these.
 //  - Like the other pointers, a pointer object must not be used by two threads at
 //    once. Any number of threads may use their own copies, that is the point.
 //
@@ -2369,6 +2403,9 @@ class SharedCopyOnWritePtr
 {
     template<typename, SharedMutex>
     friend class SharedCopyOnWritePtr;
+
+    template<typename, SharedMutex>
+    friend class WeakCopyOnWritePtr;
 
     template<typename U, SharedMutex Mx, typename Allocator, typename... Args>
         requires std::copy_constructible<U>
@@ -2736,6 +2773,165 @@ SharedCopyOnWritePtr<T, M> allocateSharedCopyOnWrite(const Allocator &allocator,
         allocator, allocateCopyOnWrite<T, M>(allocator, std::forward<Args>(args)...));
 }
 
+// Watches a slot without keeping its object alive, the way a WeakPtr watches an
+// object: lock() gives back a SharedCopyOnWritePtr for as long as a pointer of the
+// slot exists, the CopyOnWritePtr it belongs to included.
+//
+//     safe::WeakCopyOnWritePtr<Item> observer = working[3];
+//     ...
+//     if (auto item = observer.lock()) // a SharedCopyOnWritePtr, or empty
+//         item.writeLock()->name = "z"; // reaches working[3]
+//
+// It follows the slot to every clone. A WeakPtr made from the same pointer stays
+// with the object the slot had, and its lock() gives a plain SharedPtr.
+//
+// Made from a CopyOnWritePtr it gives the pointer a slot if it has none, which
+// is a read of the pointer, like making a SharedCopyOnWritePtr from it. Assigning
+// to that pointer later makes it a different pointer: the observer stays with
+// the slot it had, and expires with the last pointer of that slot.
+template<typename T, SharedMutex M>
+class WeakCopyOnWritePtr
+{
+    template<typename, SharedMutex>
+    friend class WeakCopyOnWritePtr;
+
+    using Slot = detail::CopyOnWriteSlot<M>;
+
+    Slot *m_slot{nullptr};
+    std::ptrdiff_t m_offset{0}; // see SharedCopyOnWritePtr
+
+public:
+    using ElementType = T;
+    using MutexType = M;
+
+    constexpr WeakCopyOnWritePtr() = default;
+
+    template<typename U>
+        requires std::is_convertible_v<U *, T *>
+    constexpr WeakCopyOnWritePtr(const SharedCopyOnWritePtr<U, M> &shared) noexcept
+    {
+        if constexpr (std::is_same_v<U, T>) {
+            m_slot = shared.m_slot;
+            m_offset = shared.m_offset;
+        } else {
+            // The pointer that knows where the base class is, asked of the object
+            const SharedCopyOnWritePtr<T, M> converted(shared);
+            m_slot = converted.m_slot;
+            m_offset = converted.m_offset;
+        }
+        if (m_slot)
+            m_slot->addWeak();
+    }
+
+    template<typename U>
+        requires std::is_convertible_v<U *, T *>
+    WeakCopyOnWritePtr(const CopyOnWritePtr<U, M> &pointer)
+        : WeakCopyOnWritePtr(SharedCopyOnWritePtr<T, M>(pointer))
+    {}
+
+    constexpr WeakCopyOnWritePtr(const WeakCopyOnWritePtr &other) noexcept
+        : m_slot(other.m_slot)
+        , m_offset(other.m_offset)
+    {
+        if (m_slot)
+            m_slot->addWeak();
+    }
+
+    constexpr WeakCopyOnWritePtr(WeakCopyOnWritePtr &&other) noexcept
+        : m_slot(std::exchange(other.m_slot, nullptr))
+        , m_offset(std::exchange(other.m_offset, 0))
+    {}
+
+    // Implicit conversion to a compatible pointer type (e.g. Derived -> Base).
+    // Where a base class is can only be asked of a live object, so an observer
+    // whose slot has lost its last pointer converts to an empty one.
+    template<typename U>
+        requires(!std::is_same_v<U, T> && std::is_convertible_v<U *, T *>)
+    constexpr WeakCopyOnWritePtr(const WeakCopyOnWritePtr<U, M> &other) noexcept
+        : WeakCopyOnWritePtr(SharedCopyOnWritePtr<T, M>(other.lock()))
+    {}
+
+    constexpr ~WeakCopyOnWritePtr()
+    {
+        if (m_slot)
+            m_slot->releaseWeak();
+    }
+
+    constexpr WeakCopyOnWritePtr &operator=(const WeakCopyOnWritePtr &other) noexcept
+    {
+        if (this != &other)
+            WeakCopyOnWritePtr(other).swap(*this);
+        return *this;
+    }
+
+    constexpr WeakCopyOnWritePtr &operator=(WeakCopyOnWritePtr &&other) noexcept
+    {
+        if (this != &other)
+            WeakCopyOnWritePtr(std::move(other)).swap(*this);
+        return *this;
+    }
+
+    // Everything a WeakCopyOnWritePtr can be made from can be assigned too
+    template<typename Other>
+        requires(!std::is_same_v<std::remove_cvref_t<Other>, WeakCopyOnWritePtr>
+                 && std::is_convertible_v<Other, WeakCopyOnWritePtr>)
+    constexpr WeakCopyOnWritePtr &operator=(Other &&other) noexcept(
+        std::is_nothrow_constructible_v<WeakCopyOnWritePtr, Other>)
+    {
+        WeakCopyOnWritePtr(std::forward<Other>(other)).swap(*this);
+        return *this;
+    }
+
+    constexpr void reset() noexcept { WeakCopyOnWritePtr().swap(*this); }
+
+    constexpr void swap(WeakCopyOnWritePtr &other) noexcept
+    {
+        std::swap(m_slot, other.m_slot);
+        std::swap(m_offset, other.m_offset);
+    }
+
+    // Ownership comparison: equal if they watch one slot, whichever base class
+    // they look at it through. An expired observer keeps comparing equal to its
+    // peers.
+    template<typename U>
+    constexpr bool operator==(const WeakCopyOnWritePtr<U, M> &other) const noexcept
+    {
+        return m_slot == other.m_slot;
+    }
+
+    template<typename U>
+    constexpr std::strong_ordering operator<=>(const WeakCopyOnWritePtr<U, M> &other) const noexcept
+    {
+        return std::compare_three_way{}(m_slot, other.m_slot);
+    }
+
+    // Identity of the slot, comparable with SharedCopyOnWritePtr::owner()
+    constexpr const void *owner() const noexcept { return m_slot; }
+
+    // Number of pointers sharing the slot
+    constexpr std::size_t useCount() const noexcept
+    {
+        return m_slot ? m_slot->refs.load(std::memory_order_relaxed) : 0;
+    }
+
+    constexpr bool expired() const noexcept { return useCount() == 0; }
+
+    // Another pointer of the slot, or an empty one once the slot has lost its
+    // last pointer
+    [[nodiscard]] constexpr SharedCopyOnWritePtr<T, M> lock() const noexcept
+    {
+        if (m_slot && m_slot->tryAddRef())
+            return SharedCopyOnWritePtr<T, M>(m_slot, m_offset);
+        return {};
+    }
+};
+
+template<typename T, SharedMutex M>
+constexpr void swap(WeakCopyOnWritePtr<T, M> &first, WeakCopyOnWritePtr<T, M> &second) noexcept
+{
+    first.swap(second);
+}
+
 #if SAFECPP_THROW_ON_NULL
 } // namespace throwOnNull
 #endif
@@ -2753,7 +2949,8 @@ SharedCopyOnWritePtr<T, M> allocateSharedCopyOnWrite(const Allocator &allocator,
 // if you want to key on the object it owns right now.
 //
 // A SharedCopyOnWritePtr hashes its slot, which stays the same when the object is
-// cloned, so it has no such problem.
+// cloned, so it has no such problem. A WeakCopyOnWritePtr hashes the slot it
+// watches, like the pointers of that slot.
 namespace std {
 
 template<typename T, safe::SharedMutex M>
@@ -2778,6 +2975,15 @@ template<typename T, safe::SharedMutex M>
 struct hash<safe::SharedCopyOnWritePtr<T, M>>
 {
     std::size_t operator()(const safe::SharedCopyOnWritePtr<T, M> &pointer) const noexcept
+    {
+        return std::hash<const void *>{}(pointer.owner());
+    }
+};
+
+template<typename T, safe::SharedMutex M>
+struct hash<safe::WeakCopyOnWritePtr<T, M>>
+{
+    std::size_t operator()(const safe::WeakCopyOnWritePtr<T, M> &pointer) const noexcept
     {
         return std::hash<const void *>{}(pointer.owner());
     }

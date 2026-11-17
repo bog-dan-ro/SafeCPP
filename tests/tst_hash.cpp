@@ -287,3 +287,17 @@ TEST(Hash, agreesAcrossBaseAndDerivedViewsOfASlot)
     CHECK_EQ(visits.size(), std::size_t(1));
     CHECK_EQ(visits[right], 2);
 }
+
+TEST(Hash, aWeakCopyOnWritePointerHashesTheSlotItWatches)
+{
+    static_assert(hashable<safe::WeakCopyOnWritePtr<Tracked>>);
+
+    auto pointer = safe::makeSharedCopyOnWrite<Tracked>(1);
+    safe::WeakCopyOnWritePtr<Tracked> observer = pointer;
+    CHECK_EQ(hashOf(observer), hashOf(pointer));
+
+    std::unordered_set<safe::WeakCopyOnWritePtr<Tracked>> observers{observer};
+    pointer.reset();
+    CHECK(observer.expired());
+    CHECK(observers.contains(observer)); // an expired observer is still found
+}
