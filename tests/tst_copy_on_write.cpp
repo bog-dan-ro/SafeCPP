@@ -25,6 +25,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 using namespace tst;
 
@@ -123,6 +124,14 @@ static_assert(CanSwapWith<safe::CopyOnWritePtr<Tracked>, safe::CopyOnWritePtr<Tr
 // Writing through a const CopyOnWritePtr could not detach, so it does not compile
 static_assert(CanWriteLock<safe::CopyOnWritePtr<Tracked> &>);
 static_assert(!CanWriteLock<const safe::CopyOnWritePtr<Tracked> &>);
+
+// Not a SharedPtr: no SharedPtr reference binds to one, so nothing can lock, copy
+// or re-seat it behind its back. It converts to a plain shared view instead.
+static_assert(!std::is_base_of_v<safe::SharedPtr<Tracked>, safe::CopyOnWritePtr<Tracked>>);
+static_assert(!std::is_convertible_v<safe::CopyOnWritePtr<Tracked> &, safe::SharedPtr<Tracked> &>);
+static_assert(
+    std::is_convertible_v<const safe::CopyOnWritePtr<Tracked> &, safe::SharedPtr<Tracked>>);
+static_assert(std::is_convertible_v<const safe::CopyOnWritePtr<Derived> &, safe::SharedPtr<Base>>);
 
 int readBase(const safe::CopyOnWritePtr<Base> &pointer)
 {
@@ -258,23 +267,6 @@ TEST(CopyOnWrite, castingBackFromABaseViewKeepsTheSameObject)
     CHECK_EQ(back.readLock()->derived, 2);
 }
 
-TEST(CopyOnWrite, lockThroughASharedPointerReferenceStillDetaches)
-{
-    // lock() is virtual, so copy-on-write semantics survive being reached through
-    // a base reference that has no idea it is looking at a CopyOnWritePtr
-    Tracked::resetCounters();
-    auto original = safe::makeCopyOnWrite<Tracked>(1);
-    auto copy = original;
-
-    safe::SharedPtr<Tracked> &asBase = copy;
-    asBase.writeLock()->value = 2;
-
-    CHECK_EQ(Tracked::copied.load(), 1);
-    CHECK(copy.owner() != original.owner());
-    CHECK_EQ(original.readLock()->value, 1);
-    CHECK_EQ(copy.readLock()->value, 2);
-}
-
 TEST(CopyOnWrite, aPlainSharedCopyKeepsSharedSemantics)
 {
     // Converting to a SharedPtr is an explicit request for a shared view, so
@@ -288,6 +280,50 @@ TEST(CopyOnWrite, aPlainSharedCopyKeepsSharedSemantics)
     CHECK_EQ(Tracked::copied.load(), 0);
     CHECK(shared.owner() == original.owner());
     CHECK_EQ(original.readLock()->value, 2);
+}
+
+TEST(CopyOnWrite, aSharedPointerViewWritesInPlaceForEveryBranch)
+{
+    std::vector<safe::CopyOnWritePtr<Base>> first;
+    first.push_back(safe::makeCopyOnWrite<Derived>());
+    std::vector<safe::CopyOnWritePtr<Base>> second = first;
+
+    safe::SharedPtr<Base> view = second[0];
+    CHECK(second[0] == first[0]);
+    CHECK(view == second[0]);
+    CHECK(second[0] == view);
+
+    view.writeLock()->base = 100;
+
+    // Nothing was cloned, both branches still have the object and see the write
+    CHECK(second[0] == first[0]);
+    CHECK(view == first[0]);
+    CHECK_EQ(first[0].readLock()->base, 100);
+    CHECK_EQ(second[0].readLock()->base, 100);
+}
+
+TEST(CopyOnWrite, aSharedPointerViewStaysWithTheObjectWhenThePointerDetaches)
+{
+    std::vector<safe::CopyOnWritePtr<Base>> first;
+    first.push_back(safe::makeCopyOnWrite<Derived>());
+    std::vector<safe::CopyOnWritePtr<Base>> second = first;
+
+    safe::SharedPtr<Base> view = second[0];
+    second[0].writeLock()->base = 200; // clones, first[0] and view keep the object
+
+    CHECK(second[0] != first[0]);
+    CHECK(view == first[0]);
+    CHECK(view != second[0]);
+
+    // The view knows the object, not the pointer it was made from
+    view.writeLock()->base = 101;
+    CHECK_EQ(first[0].readLock()->base, 101);
+    CHECK_EQ(second[0].readLock()->base, 200);
+
+    // The clone is the complete Derived
+    auto derived = safe::dynamicCast<Derived>(safe::SharedPtr<Base>(second[0]));
+    REQUIRE(bool(derived));
+    CHECK_EQ(derived.readLock()->derived, 2);
 }
 
 TEST(CopyOnWrite, guardOutlivingItsPointerKeepsTheDetachedCopyAlive)
@@ -322,7 +358,7 @@ TEST(CopyOnWrite, detachingABasePointerClonesTheDerivedObject)
     CHECK(d2.owner() != d1.owner());
     CHECK_EQ(d1.readLock()->base, 1);
 
-    auto derived = safe::dynamicCast<Derived>(d2);
+    auto derived = safe::dynamicCast<Derived>(safe::SharedPtr<Base>(d2));
     REQUIRE(bool(derived));
     CHECK(derived.owner() == d2.owner());
     CHECK_EQ(derived.readLock()->base, 99);
@@ -340,7 +376,7 @@ TEST(CopyOnWrite, detachesThroughAnAbstractBasePointer)
     CHECK_EQ(d1.readLock()->total(), 15);
     CHECK_EQ(d2.readLock()->total(), 30);
 
-    auto derived = safe::dynamicCast<ConcreteDerived>(d2);
+    auto derived = safe::dynamicCast<ConcreteDerived>(safe::SharedPtr<AbstractBase>(d2));
     REQUIRE(bool(derived));
     CHECK_EQ(derived.readLock()->extra, 10);
 }
@@ -356,14 +392,14 @@ TEST(CopyOnWrite, detachingWithMultipleInheritanceAdjustsTheSubobjectPointer)
     CHECK_EQ(r1.readLock()->right, 20);
     CHECK_EQ(r2.readLock()->right, 200);
 
-    auto both = safe::dynamicCast<Both>(r2);
+    auto both = safe::dynamicCast<Both>(safe::SharedPtr<Right>(r2));
     REQUIRE(bool(both));
     CHECK(both.owner() == r2.owner());
     CHECK_EQ(both.readLock()->left, 10);
     CHECK_EQ(both.readLock()->right, 200);
     CHECK_EQ(both.readLock()->both, 30);
 
-    auto left = safe::dynamicCast<Left>(r2);
+    auto left = safe::dynamicCast<Left>(safe::SharedPtr<Right>(r2));
     REQUIRE(bool(left));
     CHECK_EQ(left.readLock()->left, 10);
 }
@@ -425,7 +461,7 @@ TEST(CopyOnWrite, upcastsImplicitlyWhenPassedToAFunction)
     CHECK(written.owner() != derived.owner());
     CHECK_EQ(derived.readLock()->base, 1);
 
-    auto writtenDerived = safe::dynamicCast<Derived>(written);
+    auto writtenDerived = safe::dynamicCast<Derived>(safe::SharedPtr<Base>(written));
     REQUIRE(bool(writtenDerived));
     CHECK_EQ(writtenDerived.readLock()->base, 50);
     CHECK_EQ(writtenDerived.readLock()->derived, 7);
@@ -451,7 +487,7 @@ TEST(CopyOnWrite, upcastOfAnAdoptedSharedPointerStillClonesTheCompleteObject)
     CHECK(right.owner() != shared.owner());
     CHECK_EQ(shared.readLock()->right, 20);
 
-    auto clone = safe::dynamicCast<Both>(right);
+    auto clone = safe::dynamicCast<Both>(safe::SharedPtr<Right>(right));
     REQUIRE(bool(clone));
     CHECK_EQ(clone.readLock()->left, 10);
     CHECK_EQ(clone.readLock()->right, 200);
@@ -462,7 +498,7 @@ TEST(CopyOnWrite, upcastOfAnAdoptedSharedPointerStillClonesTheCompleteObject)
     safe::CopyOnWritePtr<Base> base = sharedDerived;
     base.writeLock()->base = 9;
 
-    auto cloneDerived = safe::dynamicCast<Derived>(base);
+    auto cloneDerived = safe::dynamicCast<Derived>(safe::SharedPtr<Base>(base));
     REQUIRE(bool(cloneDerived));
     CHECK(cloneDerived.owner() != sharedDerived.owner());
     CHECK_EQ(cloneDerived.readLock()->base, 9);
@@ -482,7 +518,7 @@ TEST(CopyOnWrite, aCloneOfAnAdoptedObjectCanBeClonedAgain)
     CHECK_EQ(shared.readLock()->base, 1);
     CHECK_EQ(first.readLock()->base, 2);
     CHECK_EQ(second.readLock()->base, 3);
-    REQUIRE(bool(safe::dynamicCast<Derived>(second)));
+    REQUIRE(bool(safe::dynamicCast<Derived>(safe::SharedPtr<Base>(second))));
 }
 
 TEST(CopyOnWrite, adoptingADowncastPointerClonesTheCompleteObject)
@@ -515,7 +551,7 @@ TEST(CopyOnWrite, adoptingThroughABasePointerClonesTheStaticType)
 
     CHECK(cow.owner() != shared.owner());
     CHECK_EQ(cow.readLock()->base, 4);
-    CHECK(!safe::dynamicCast<Derived>(cow));
+    CHECK(!safe::dynamicCast<Derived>(safe::SharedPtr<Base>(cow)));
     CHECK(bool(safe::dynamicCast<Derived>(shared)));
     CHECK_EQ(shared.readLock()->base, 1);
 }
@@ -576,54 +612,27 @@ TEST(CopyOnWrite, swapAndAssignmentCarryTheCloneAlong)
 
     made.writeLock()->base = 2;
     adopted.writeLock()->base = 3;
-    CHECK(bool(safe::dynamicCast<Derived>(made)));
-    CHECK(bool(safe::dynamicCast<Unrelated>(adopted)));
+    CHECK(bool(safe::dynamicCast<Derived>(safe::SharedPtr<Base>(made))));
+    CHECK(bool(safe::dynamicCast<Unrelated>(safe::SharedPtr<Base>(adopted))));
 
     // Assigning replaces whatever the target knew about its previous object
     safe::CopyOnWritePtr<Base> target = safe::makeShared<Base>();
     target = sharedDerived;
     target.writeLock()->base = 5;
-    CHECK(bool(safe::dynamicCast<Derived>(target)));
+    CHECK(bool(safe::dynamicCast<Derived>(safe::SharedPtr<Base>(target))));
     CHECK_EQ(sharedDerived.readLock()->base, 1);
 
     target = madeKeeper;
     target.writeLock()->base = 6;
-    CHECK(bool(safe::dynamicCast<Unrelated>(target)));
+    CHECK(bool(safe::dynamicCast<Unrelated>(safe::SharedPtr<Base>(target))));
     CHECK_EQ(madeKeeper.readLock()->base, 1);
-}
-
-TEST(CopyOnWrite, refusesToWriteAfterBeingReseatedThroughASharedPointerReference)
-{
-    Tracked::resetCounters();
-    auto plain = safe::makeShared<Tracked>(2);
-    auto cow = safe::makeCopyOnWrite<Tracked>(1);
-
-    // Bypasses CopyOnWritePtr: it now shares an object nobody told it how to clone
-    safe::SharedPtr<Tracked> &asBase = cow;
-    asBase = plain;
-
-    bool refused = false;
-    try {
-        cow.writeLock()->value = 3;
-    } catch (const std::logic_error &) {
-        refused = true;
-    }
-
-    CHECK(refused);
-    CHECK_EQ(plain.readLock()->value, 2); // the other owner was not written to
-    CHECK(cow.owner() == plain.owner());
-    CHECK_EQ(Tracked::copied.load(), 0);
-
-    // Still usable: as the sole owner there is nothing to clone
-    plain.reset();
-    cow.writeLock()->value = 4;
-    CHECK_EQ(cow.readLock()->value, 4);
 }
 
 TEST(CopyOnWrite, writeLockThroughAConstSharedPointerWritesInPlaceOnPurpose)
 {
     // Documented in the README: a const SharedPtr & is the way to update the
-    // shared object for every owner without detaching
+    // shared object for every owner without detaching. It binds to a SharedPtr
+    // made from the pointer, which shares the object without being the pointer.
     Tracked::resetCounters();
     auto a = safe::makeCopyOnWrite<Tracked>(1);
     auto b = a;

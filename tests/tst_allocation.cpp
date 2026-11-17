@@ -431,7 +431,7 @@ TEST(Allocation, copyOnWriteClonesAnAdoptedExternalObjectAsItsStaticType)
         CHECK(copy.owner() != shared.owner());
         CHECK_EQ(shared.readLock()->base, 1);
 
-        auto derived = safe::dynamicCast<Derived>(copy);
+        auto derived = safe::dynamicCast<Derived>(safe::SharedPtr<Base>(copy));
         REQUIRE(bool(derived));
         CHECK_EQ(derived.readLock()->base, 55);
         CHECK_EQ(derived.readLock()->derived, 2);
@@ -461,11 +461,103 @@ TEST(Allocation, allocateCopyOnWritePreservesTheAllocatorAcrossDetach)
         d2.writeLock()->base = 77;
         CHECK_EQ(stats.allocations, 2);
 
-        auto derived = safe::dynamicCast<Derived>(d2);
+        auto derived = safe::dynamicCast<Derived>(safe::SharedPtr<Base>(d2));
         REQUIRE(bool(derived));
         CHECK_EQ(derived.readLock()->base, 77);
         CHECK_EQ(derived.readLock()->derived, 2);
     }
 
     CHECK_EQ(stats.deallocations, 2);
+}
+
+TEST(Allocation, allocateSharedCopyOnWriteUsesTheAllocatorForTheSlotAndEveryClone)
+{
+    Tracked::resetCounters();
+    AllocationStats stats;
+
+    {
+        auto pointer = safe::allocateSharedCopyOnWrite<Tracked>(CountingAllocator<std::byte>(stats),
+                                                                1);
+        CHECK_EQ(stats.allocations, 2); // the object and the slot
+        CHECK_EQ(stats.trackedConstructions, 1);
+
+        auto copy = pointer;
+        copy.writeLock()->value = 2; // unshared, nothing to allocate
+        CHECK_EQ(stats.allocations, 2);
+
+        auto snapshot = pointer.snapshot();
+        CHECK_EQ(stats.allocations, 2);
+
+        pointer.writeLock()->value = 3; // the clone comes from the allocator too
+        CHECK_EQ(stats.allocations, 3);
+        CHECK_EQ(stats.trackedConstructions, 2);
+        CHECK_EQ(snapshot.readLock()->value, 2);
+        CHECK_EQ(copy.readLock()->value, 3);
+    }
+
+    CHECK_EQ(stats.deallocations, 3);
+    CHECK_EQ(stats.trackedDestructions, 2);
+    CHECK_EQ(Tracked::alive.load(), 0);
+}
+
+namespace {
+
+// Lets the first allocation through and refuses the next one
+template<typename T>
+class SecondAllocationFails
+{
+public:
+    using value_type = T;
+
+    AllocationStats *stats = nullptr;
+
+    explicit SecondAllocationFails(AllocationStats &stats) noexcept
+        : stats(&stats)
+    {}
+
+    template<typename U>
+    SecondAllocationFails(const SecondAllocationFails<U> &other) noexcept
+        : stats(other.stats)
+    {}
+
+    T *allocate(std::size_t count)
+    {
+        if (stats->allocations == 1)
+            throw std::bad_alloc{};
+        ++stats->allocations;
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T *pointer, std::size_t count) noexcept
+    {
+        ++stats->deallocations;
+        std::allocator<T>{}.deallocate(pointer, count);
+    }
+
+    template<typename U>
+    bool operator==(const SecondAllocationFails<U> &other) const noexcept
+    {
+        return stats == other.stats;
+    }
+};
+
+} // namespace
+
+TEST(Allocation, allocateSharedCopyOnWriteRollsBackWhenTheSlotCannotBeAllocated)
+{
+    Tracked::resetCounters();
+    AllocationStats stats;
+
+    bool failed = false;
+    try {
+        auto pointer =
+            safe::allocateSharedCopyOnWrite<Tracked>(SecondAllocationFails<std::byte>(stats), 1);
+    } catch (const std::bad_alloc &) {
+        failed = true;
+    }
+
+    CHECK(failed);
+    CHECK_EQ(stats.allocations, 1); // the object made it, the slot did not
+    CHECK_EQ(stats.deallocations, 1);
+    CHECK_EQ(Tracked::alive.load(), 0);
 }

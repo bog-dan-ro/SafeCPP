@@ -23,6 +23,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <SafeCpp.h>
 
 #include <print>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -115,6 +116,43 @@ void copyOnWrite()
             original == copy);
 }
 
+void sharedCopyOnWrite()
+{
+    println("handing out a copy-on-write pointer by value");
+    vector<safe::CopyOnWritePtr<Base>> original;
+    original.push_back(safe::makeCopyOnWrite<Derived>());
+
+    // Nothing is cloned, both vectors share the Derived
+    vector<safe::CopyOnWritePtr<Base>> working = original;
+
+    // Returning a CopyOnWritePtr here would hand out independent copies, and a
+    // write through one of them would be lost. A SharedCopyOnWritePtr stays with
+    // working[index].
+    const auto item = [&working](size_t index) -> safe::SharedCopyOnWritePtr<Base> {
+        return working[index];
+    };
+
+    auto early = item(0);
+    item(0).writeLock()->b = 9; // clones once, for working[0]
+    item(0).writeLock()->b += 1; // in place
+
+    println("  original = {}, working = {}, early copy = {}",
+            original[0].readLock()->b,
+            working[0].readLock()->b,
+            early.readLock()->b);
+
+    // A cast stays on the slot too, and the clone was a whole Derived
+    safe::staticCast<Derived>(item(0)).writeLock()->d += 1;
+    println("  d: original = {}, working = {}",
+            safe::staticCast<Derived>(safe::SharedPtr<Base>(original[0])).readLock()->d,
+            safe::staticCast<Derived>(item(0)).readLock()->d);
+
+    // The way out: an independent CopyOnWritePtr to the current value
+    auto snapshot = item(0).snapshot();
+    item(0).writeLock()->b = 1;
+    println("  snapshot = {}, working = {}", snapshot.readLock()->b, working[0].readLock()->b);
+}
+
 void conversionsAndCasts()
 {
     println("conversions and casts");
@@ -178,6 +216,26 @@ void manyThreads()
     println("  8 threads x 1000 increments = {}", *counter.readLock());
 }
 
+void spinLocks()
+{
+    println("spin locks");
+    // For critical sections of a few instructions: waiters spin instead of sleeping
+    auto counter = safe::makeShared<int, safe::SharedSpinLock>(0);
+    {
+        vector<jthread> threads;
+        for (int i = 0; i < 8; ++i) {
+            threads.emplace_back([counter]() mutable {
+                for (int n = 0; n < 1000; ++n)
+                    ++*counter.writeLock();
+            });
+        }
+    }
+    println("  8 threads x 1000 increments = {}, the lock is {} bytes instead of {}",
+            *counter.readLock(),
+            sizeof(safe::SharedSpinLock),
+            sizeof(shared_mutex));
+}
+
 void unorderedContainers()
 {
     println("Pointers as keys:");
@@ -217,10 +275,12 @@ int main()
     locking();
     sharingAndObserving();
     copyOnWrite();
+    sharedCopyOnWrite();
     conversionsAndCasts();
     severalObjectsAtOnce();
     pointerFromInsideTheObject();
     manyThreads();
+    spinLocks();
     unorderedContainers();
     return 0;
 }

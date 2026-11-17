@@ -17,6 +17,7 @@ endif()
 option(SAFECPP_BUILD_EXAMPLES "Build the examples" ${SAFECPP_IS_TOP_LEVEL})
 option(SAFECPP_BUILD_TESTS "Build the unit tests" ${SAFECPP_IS_TOP_LEVEL})
 option(SAFECPP_INSTALL "Generate the install and package rules" ${SAFECPP_IS_TOP_LEVEL})
+option(SAFECPP_THROW_ON_NULL "Throw safe::BadPointerAccess on a null pointer instead of asserting" OFF)
 
 # ---------------------------------------------------------------- the library
 
@@ -25,6 +26,12 @@ add_library(Safe::CPP ALIAS SafeCpp)
 
 # C++23 is the public baseline for the library and all consumers.
 target_compile_features(SafeCpp INTERFACE cxx_std_23)
+
+# Part of the interface, so every user of the target, the installed one included,
+# builds the pointers the same way
+if(SAFECPP_THROW_ON_NULL)
+    target_compile_definitions(SafeCpp INTERFACE SAFECPP_THROW_ON_NULL=1)
+endif()
 
 target_include_directories(SafeCpp INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>

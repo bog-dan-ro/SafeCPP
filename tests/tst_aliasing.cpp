@@ -21,6 +21,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "TestTypes.h"
 
 #include <functional>
+#include <type_traits>
 #include <utility>
 
 using namespace tst;
@@ -34,6 +35,14 @@ struct Pair
 };
 
 } // namespace
+
+// Only a null owner or alias could make aliasing fail, and that throws only if
+// SAFECPP_THROW_ON_NULL says so
+static_assert(
+    std::is_nothrow_constructible_v<safe::SharedPtr<int>, const safe::SharedPtr<Pair> &, int *>
+    == !SAFECPP_THROW_ON_NULL);
+static_assert(std::is_nothrow_constructible_v<safe::SharedPtr<int>, safe::SharedPtr<Pair> &&, int *>
+              == !SAFECPP_THROW_ON_NULL);
 
 TEST(Aliasing, exposesAMemberWhileSharingTheOwner)
 {

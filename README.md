@@ -58,6 +58,22 @@ do not need to set `CMAKE_CXX_STANDARD` yourself.
 #include <SafeCpp.h>
 ```
 
+A null pointer where a valid one is needed (locking it, `lockAll`, adopting a raw
+pointer, aliasing) is a precondition violation: an assert in debug builds, undefined
+behavior in release builds. If you would rather have an exception, turn on
+`SAFECPP_THROW_ON_NULL` and `safe::BadPointerAccess`, a `std::logic_error`, is thrown
+instead. The aliasing constructors are not `noexcept` then.
+
+```cmake
+set(SAFECPP_THROW_ON_NULL ON)                  # before FetchContent_MakeAvailable
+```
+
+The setting travels with the `Safe::CPP` target, the installed one included. Without
+CMake, define `SAFECPP_THROW_ON_NULL` to `1` before including the header. Code built
+with and without it can be linked into one program, it just cannot share pointers:
+in that mode the library lives in an inline namespace of its own, so handing a
+pointer from one side to the other fails to link instead of silently mixing the two.
+
 ## Examples
 
 ### Reading and writing
@@ -135,20 +151,91 @@ a pointer to the complete type, a `SharedPtr<Base>` holding a `Derived` is clone
 a `Base`. `U` must be copy constructible, which is checked at compile time; plain
 `SharedPtr`s have no such requirement.
 
-Only a `writeLock()` called on the `CopyOnWritePtr` itself (or on a non-const
-`SharedPtr&` bound to it) detaches. Through a `const SharedPtr<T> &` the lock writes
-to the shared object in place and every other owner sees the change. This is
-intentional: handing out a `const SharedPtr<T> &` is how you opt out of the clone
-when you want to update the shared object for everyone.
+A `CopyOnWritePtr` is not a `SharedPtr`, but it converts to one, and that is how you
+opt out of the clone when you want to update the shared object for everyone. The
+`SharedPtr` shares the object the pointer has at that moment, and a write through it
+goes to that object in place, so every owner sees it. Passing the pointer where a
+`const SharedPtr<T> &` is expected does the same. The view stays with the object, not
+with the pointer: once the pointer clones on a write of its own, the view is left
+with the other owners.
 
 ```cpp
 auto a = safe::makeCopyOnWrite<Config>();
 auto b = a;
 
-const safe::SharedPtr<Config> &shared = a;
+safe::SharedPtr<Config> shared = a;
 shared.writeLock()->retries = 1;               // no clone, a and b both see it
-a.writeLock()->retries = 2;                    // clones, b keeps 1
+a.writeLock()->retries = 2;                    // clones, b and shared keep 1
+shared.writeLock()->retries = 4;               // b sees it, a does not
 ```
+
+### Handing out a copy-on-write pointer by value
+
+Every copy of a `CopyOnWritePtr` goes its own way. That is the wrong thing for a
+function returning an element of a container by value: the write lands in a clone
+that only the temporary owns.
+
+```cpp
+std::vector<safe::CopyOnWritePtr<Item>> items;
+safe::CopyOnWritePtr<Item> item(std::size_t i) { return items[i]; }
+
+item(3).writeLock()->name = "x";               // clones, writes, and the clone is gone
+```
+
+Return a `SharedCopyOnWritePtr` instead. Think of it as a
+`std::shared_ptr<CopyOnWritePtr<T>>` that locks only once: it stays with the
+`CopyOnWritePtr` it was made from, and a write through it is a write through that
+pointer.
+
+```cpp
+std::vector<safe::CopyOnWritePtr<Item>> original = load();
+std::vector<safe::CopyOnWritePtr<Item>> working = original;   // shares every Item
+
+safe::SharedCopyOnWritePtr<Item> item(std::size_t i) { return working[i]; }
+
+auto early = item(3);
+item(3).writeLock()->name = "x";               // clones once
+                                               // working[3] and early have "x", original[3] does not
+item(3).writeLock()->name = "y";               // in place, nothing left to clone
+```
+
+`working[3]`, `early` and whatever else `item(3)` returns share one *slot*, which
+knows the object they currently have. A copy of `working[3]` is still an independent
+`CopyOnWritePtr`, so copying the container starts a new branch as before.
+
+- **One lock.** `writeLock()` and `readLock()` return the usual guards, straight to
+  `T`, holding the one mutex that protects it. A write lock keeps every other pointer
+  of the slot out and waits for their guards; contention never clones. The single
+  exception is the write that moves the slot to its clone: it does not wait for the
+  readers of the object it leaves behind, they finish on the value they have.
+- **Making one only reads the `CopyOnWritePtr`.** Any number of threads may call
+  `item(3)` at once, on a const container too. The price: the `CopyOnWritePtr` keeps
+  the reference it had, so the first write through the slot clones even when nobody
+  else has the object, and that object stays alive. Both end as soon as the
+  `CopyOnWritePtr` is used in a way that needs it exclusively anyway: its own
+  `writeLock()`, or a move (a growing `std::vector` moves its elements).
+- **Assigning to the `CopyOnWritePtr` makes it a different pointer.** The
+  `SharedCopyOnWritePtr`s made before keep their slot and its value; moving the
+  pointer takes them along.
+- **`snapshot()` is the way out.** It returns an independent `CopyOnWritePtr` to the
+  current value without cloning anything; the slot clones on its next write. It never
+  waits: taken while another thread holds a write lock, it shows what that write
+  leaves behind. `CopyOnWritePtr<Item> branch(p)` does the same; it is explicit, so a
+  function still declared to return a `CopyOnWritePtr` does not compile instead of
+  handing out detached copies again.
+- **`writeLock()` is const**, so it works on a temporary and on a const pointer. A
+  write changes the object and the slot, never the pointer.
+- **Two kinds of equality.** Two `SharedCopyOnWritePtr` are equal if they share a
+  slot, for good. Against a `SharedPtr` or a `CopyOnWritePtr`, `==` asks whether the
+  slot holds that pointer's object right now. `useCount()` counts the pointers on the
+  slot, `weakCount()` the observers of the current object; a `WeakPtr` made from the
+  pointer watches that object, not the slot.
+- **It is not a `SharedPtr`:** no implicit conversion to one, and no `lockAll`.
+
+Made from a temporary `CopyOnWritePtr`, or by `makeSharedCopyOnWrite` /
+`allocateSharedCopyOnWrite`, the slot belongs to the `SharedCopyOnWritePtr`s alone.
+Up-casts to a base class share the slot and clone the complete object: an object
+created as a `Derived` is cloned as a `Derived`, whichever `Base` view writes to it.
 
 ### Base classes and casts
 
@@ -162,6 +249,27 @@ safe::SharedPtr<Base> base = derived;          // implicit
 if (auto back = safe::dynamicCast<Derived>(base))
     back.writeLock()->somethingDerived();
 ```
+
+A cast returns the kind of pointer it was given, and a `CopyOnWritePtr` cannot be
+cast at all: the result would be a pointer of its own, and whether a write through
+it clones (and is lost) or writes in place for every owner would be anybody's guess.
+Convert first, and the conversion says which one you mean:
+
+```cpp
+std::vector<safe::CopyOnWritePtr<Base>> working = original;
+safe::SharedCopyOnWritePtr<Base> item(std::size_t i) { return working[i]; }
+
+// stays copy-on-write: working[3] is cloned if need be, original[3] never changes
+safe::staticCast<Derived>(item(3)).writeLock()->extra = 2;
+
+// a plain shared view: writes in place, for everyone who has the object
+safe::staticCast<Derived>(safe::SharedPtr<Base>(working[3])).writeLock()->extra = 2;
+```
+
+A cast of a `SharedCopyOnWritePtr` comes back empty if it fails, and in one more
+case: an object adopted from a plain `SharedPtr` is cloned as the type it was adopted
+as, so a pointer to more than that type is refused. Cast the `SharedPtr` before
+adopting it.
 
 ### Locking several objects at once
 
@@ -206,6 +314,9 @@ detaching moves it to a fresh control block, so a key already in a container wou
 silently stop matching it. Convert it to a `SharedPtr` if you want to key on the
 object it owns right now.
 
+A `SharedCopyOnWritePtr` has no such problem. Its identity is the slot, which stays
+the same when the object is cloned, so it is hashable and ordered like the others.
+
 ### Bringing your own mutex
 
 The second template parameter is any type satisfying `safe::SharedMutex`
@@ -215,6 +326,28 @@ The second template parameter is any type satisfying `safe::SharedMutex`
 ```cpp
 auto pointer = safe::makeShared<Config, MyTracingMutex>();
 ```
+
+### Spin locks
+
+`safe::SharedSpinLock` is such a mutex: many readers or one writer in four bytes,
+and it never puts a thread to sleep. A waiter spins, and yields once that took too
+long. That beats a real mutex when the critical section is a handful of instructions:
+
+```cpp
+auto user = safe::makeShared<User, safe::SharedSpinLock>();
+
+user.writeLock()->setName("Claude");           // shorter than a trip into the kernel
+```
+
+It is the wrong tool for anything longer, where the waiters burn the CPU the owner
+needs. A waiting writer keeps new readers out, so readers cannot starve the writers;
+the locks are neither fair nor recursive. `safe::SpinLock` is the exclusive-only
+sibling for your own data. It is not a `SharedMutex`, so it cannot protect a pointer.
+Both use the standard member names and work with `std::lock_guard`,
+`std::scoped_lock` and `std::shared_lock`.
+
+Nothing in SafeCpp uses `SharedSpinLock` unless you ask for it: the default mutex is
+still `std::shared_mutex`.
 
 ### Aliasing a protected subobject
 
@@ -279,17 +412,22 @@ that cannot be constant-evaluated by this implementation.
 |---|---|
 | `makeShared<T>(args…)` / `allocateShared<T>(allocator, args…)` | in-place construction |
 | `makeCopyOnWrite<T>(args…)` / `allocateCopyOnWrite<T>(allocator, args…)` | constructs a copy-on-write pointer |
+| `makeSharedCopyOnWrite<T>(args…)` / `allocateSharedCopyOnWrite<T>(allocator, args…)` | a copy-on-write pointer whose copies share one slot |
+| `SharedCopyOnWritePtr = copyOnWritePtr` / `snapshot()` | shares the slot of that pointer / an independent `CopyOnWritePtr` again |
+| `SharedPtr = copyOnWritePtr` | a plain shared view of its object: writes in place, never clones |
 | `SharedPtr(pointer[, deleter[, allocator]])` | adopts a non-null external object |
 | `SharedPtr(owner, alias)` | shares an owner while exposing a protected subobject |
 | `writeLock()` / `readLock()` | exclusive / shared guard, the only access to `T` |
 | `lockAll(a, b, …)` | deadlock free multi lock, `get<I>()` per object |
 | `WeakPtr::lock()` / `expired()` | promote to an owner / cheap check |
-| `staticCast` / `dynamicCast` / `constCast` | share the control block |
+| `staticCast` / `dynamicCast` / `constCast` | share the control block, or the slot; not for `CopyOnWritePtr` |
 | `getDeleter<D>(pointer)` | query an externally supplied deleter |
 | `useCount()` / `weakCount()` / `owner()` | owners, observers, identity |
 | `reset()` / `swap()` / `==` / `<=>` | ownership comparison, ordered container friendly |
-| `std::hash<SharedPtr/WeakPtr>` | hashes the owner, unordered container friendly |
+| `std::hash<SharedPtr/WeakPtr/SharedCopyOnWritePtr>` | hashes the owner, unordered container friendly |
 | `EnableSharedFromThis<T>` | `sharedFromThis()`, `weakFromThis()` |
+| `SharedSpinLock` / `SpinLock` | spin locks; the shared one can be a pointer's mutex |
+| `SAFECPP_THROW_ON_NULL` / `BadPointerAccess` | a null pointer throws instead of asserting |
 
 ## Things it deliberately does not do
 

@@ -454,7 +454,7 @@ TEST(Api, sharedFromThisOnADerivedTypeSurvivesDetachThroughAnUnrelatedBase)
 
     d2.writeLock()->base = 42;
 
-    auto derived2 = safe::dynamicCast<DerivedEsftOnly>(d2);
+    auto derived2 = safe::dynamicCast<DerivedEsftOnly>(safe::SharedPtr<Base>(d2));
     REQUIRE(bool(derived2));
     auto self2 = derived2.readLock()->sharedFromThis();
     REQUIRE(bool(self2));

@@ -244,3 +244,46 @@ TEST(Hash, comparesWeakPointersByOwner)
     safe::WeakPtr<Derived> empty;
     CHECK(empty.owner() == nullptr);
 }
+
+TEST(Hash, followsTheSlotOfASharedCopyOnWritePointer)
+{
+    static_assert(hashable<safe::SharedCopyOnWritePtr<Tracked>>);
+    static_assert(hashable<safe::SharedCopyOnWritePtr<Tracked, InstrumentedMutex>>);
+
+    auto source = safe::makeCopyOnWrite<Tracked>(1);
+    auto element = source;
+    safe::SharedCopyOnWritePtr<Tracked> pointer = element;
+    safe::SharedCopyOnWritePtr<Tracked> copy = element; // the slot of element again
+    safe::SharedCopyOnWritePtr<Tracked> other = source; // the slot of another pointer
+
+    CHECK_EQ(hashOf(pointer), hashOf(copy));
+    CHECK_EQ(hashOf(pointer), std::hash<const void *>{}(pointer.owner()));
+    CHECK(hashOf(pointer) != hashOf(other)); // same object, different slots
+
+    std::unordered_set<safe::SharedCopyOnWritePtr<Tracked>> slots{pointer, copy, other};
+    CHECK_EQ(slots.size(), std::size_t(2));
+
+    // Unlike a CopyOnWritePtr, the key survives the object being cloned
+    const std::size_t before = hashOf(pointer);
+    copy.writeLock()->value = 2;
+    CHECK_EQ(hashOf(pointer), before);
+    CHECK(slots.contains(pointer));
+    CHECK(slots.contains(copy));
+
+    safe::SharedCopyOnWritePtr<Tracked> empty;
+    CHECK_EQ(hashOf(empty), std::hash<const void *>{}(nullptr));
+}
+
+TEST(Hash, agreesAcrossBaseAndDerivedViewsOfASlot)
+{
+    auto derived = safe::makeSharedCopyOnWrite<Both>();
+    safe::SharedCopyOnWritePtr<Right> right = derived;
+
+    CHECK_EQ(hashOf(derived), hashOf(right));
+
+    std::unordered_map<safe::SharedCopyOnWritePtr<Right>, int> visits;
+    visits[right] = 1;
+    visits[derived] += 1; // converts, and finds the same entry
+    CHECK_EQ(visits.size(), std::size_t(1));
+    CHECK_EQ(visits[right], 2);
+}
